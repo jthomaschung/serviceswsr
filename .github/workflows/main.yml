@@ -1,0 +1,82 @@
+name: WSR Weekly Automation
+
+on:
+  schedule:
+    # Runs every Wednesday at noon EST (5 PM UTC)
+    # Adjust timezone by changing the hour (17 = noon EST, 18 = noon CST, 19 = noon MST, 20 = noon PST)
+    - cron: '0 17 * * 3'
+  
+  # Allow manual triggering for testing
+  workflow_dispatch:
+
+jobs:
+  process-wsr:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright pandas python-dotenv xlrd openpyxl
+          pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          pip install supabase
+          playwright install chromium
+      
+      - name: Create directories
+        run: |
+          mkdir -p downloads
+          mkdir -p processed
+      
+      - name: Create .env file from secrets
+        run: |
+          cat > .env << EOF
+          JJ_EMAIL=${{ secrets.JJ_EMAIL }}
+          JJ_PASSWORD=${{ secrets.JJ_PASSWORD }}
+          WEEKS_TO_DOWNLOAD=3
+          DOWNLOAD_DIR=./downloads
+          PROCESSED_DIR=./processed
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_PATH=./credentials.json
+          EOF
+      
+      - name: Create Google credentials file
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+      
+      - name: Run WSR Bot (Download Reports)
+        run: |
+          echo "=========================================="
+          echo "STEP 1: Downloading WSR Reports"
+          echo "=========================================="
+          python jj_wsr_bot.py
+      
+      - name: Run WSR Parser (Process & Upload)
+        run: |
+          echo "=========================================="
+          echo "STEP 2: Processing and Uploading Data"
+          echo "=========================================="
+          python wsr_parser.py < <(echo "y")
+      
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: wsr-logs
+          path: |
+            *.log
+          retention-days: 7
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ WSR automation failed. Check the logs for details."
