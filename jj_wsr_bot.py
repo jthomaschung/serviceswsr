@@ -395,7 +395,7 @@ class JimmyJohnsWSRBot:
             with sync_playwright() as p:
                 # Launch browser
                 browser = p.chromium.launch(
-                    headless=False,  # Set to True for production
+                    headless=True,  # Required for GitHub Actions
                     args=['--disable-blink-features=AutomationControlled']
                 )
                 
