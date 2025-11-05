@@ -116,6 +116,14 @@ class WSRParser:
                     if idx <= 11:
                         logger.info(f"  Row {idx}: {row}")
                     
+                    # Get Name from column C (index 2)
+                    name = ''
+                    if len(row) > 2 and row[2]:
+                        val = row[2].strip()
+                        # Only use it as a name if it's NOT "Debit" or "Credit"
+                        if val.lower() not in ['debit', 'credit']:
+                            name = val
+                    
                     # Find Debit/Credit - could be in column C (index 2) or D (index 3)
                     # depending on whether Column C (Name) is populated
                     debit_credit = 'Debit'  # Default
@@ -133,11 +141,13 @@ class WSRParser:
                     if wsr_name and qbo_name:
                         mapping[wsr_name] = {
                             'qbo_account': qbo_name,
-                            'debit_credit': debit_credit
+                            'debit_credit': debit_credit,
+                            'name': name
                         }
                         # Log first 5 mappings to verify
                         if len(mapping) <= 5:
-                            logger.info(f"  ✓ {wsr_name} -> {qbo_name} ({debit_credit})")
+                            name_info = f" -> {name}" if name else ""
+                            logger.info(f"  ✓ {wsr_name} -> {qbo_name} ({debit_credit}){name_info}")
             
             logger.info(f"✓ Loaded {len(mapping)} account mappings from Key tab")
             return mapping
@@ -546,6 +556,7 @@ class WSRParser:
                 # Get mapping info
                 qbo_account = mapping_info['qbo_account']
                 debit_credit = mapping_info['debit_credit']
+                name = mapping_info.get('name', '')  # Get name, default to empty string if not present
                 
                 # DEBUG: Log the first few transformations
                 if len(data_rows) < 3:
@@ -572,7 +583,7 @@ class WSRParser:
                     adjusted_amount,           # B: Amount (adjusted for debit/credit)
                     record['week_ending'],     # C: Journal Date
                     record['description'],     # D: Description
-                    '',                        # E: Name (blank)
+                    name,                      # E: Name (from Key tab column C, e.g., "House Account")
                     record['class_code']       # F: Class (like "2811 - Edinger")
                 ])
             
