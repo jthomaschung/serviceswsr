@@ -1,0 +1,10 @@
+playwright==1.40.0
+pandas==2.1.4
+python-dotenv==1.0.0
+xlrd==2.0.1
+openpyxl==3.1.2
+google-api-python-client==2.111.0
+google-auth==2.25.2
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+supabase==2.3.0
