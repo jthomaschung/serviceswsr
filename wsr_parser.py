@@ -120,22 +120,22 @@ class WSRParser:
                     name = ''
                     if len(row) > 2 and row[2]:
                         val = row[2].strip()
-                        # Only use it as a name if it's NOT "Debit" or "Credit"
-                        if val.lower() not in ['debit', 'credit']:
+                        # Only use it as a name if it's NOT "Debit", "Credit", or "Reverse"
+                        if val.lower() not in ['debit', 'credit', 'reverse']:
                             name = val
                     
-                    # Find Debit/Credit - could be in column C (index 2) or D (index 3)
+                    # Find Debit/Credit/Reverse - could be in column C (index 2) or D (index 3)
                     # depending on whether Column C (Name) is populated
                     debit_credit = 'Debit'  # Default
                     
                     # Check index 3 first (Column D)
                     if len(row) > 3 and row[3]:
                         debit_credit = row[3].strip()
-                    # If not found, check index 2 (Column C might have Debit/Credit if Name is empty)
+                    # If not found, check index 2 (Column C might have Debit/Credit/Reverse if Name is empty)
                     elif len(row) > 2 and row[2]:
                         val = row[2].strip()
-                        # Only use it if it's actually "Debit" or "Credit"
-                        if val.lower() in ['debit', 'credit']:
+                        # Only use it if it's actually "Debit", "Credit", or "Reverse"
+                        if val.lower() in ['debit', 'credit', 'reverse']:
                             debit_credit = val
                     
                     if wsr_name and qbo_name:
@@ -562,16 +562,24 @@ class WSRParser:
                 if len(data_rows) < 3:
                     logger.info(f"  DEBUG: {sales_item}")
                     logger.info(f"    Original amount: {amount}")
-                    logger.info(f"    Debit/Credit: '{debit_credit}' (lower: '{debit_credit.lower()}')")
+                    logger.info(f"    Debit/Credit/Reverse: '{debit_credit}' (lower: '{debit_credit.lower()}')")
                 
-                # Apply debit/credit logic: DEBITS = NEGATIVE, CREDITS = POSITIVE
+                # Apply debit/credit/reverse logic
                 adjusted_amount = amount
-                if debit_credit.lower() == 'debit' and amount > 0:
-                    adjusted_amount = -amount  # Make debits negative
+                
+                if debit_credit.lower() == 'reverse':
+                    # REVERSE: Always flip the sign, regardless of what it is
+                    adjusted_amount = -amount
+                    if len(data_rows) < 3:
+                        logger.info(f"    APPLIED REVERSE LOGIC: {amount} -> {adjusted_amount}")
+                elif debit_credit.lower() == 'debit' and amount > 0:
+                    # DEBIT: Make positive amounts negative
+                    adjusted_amount = -amount
                     if len(data_rows) < 3:
                         logger.info(f"    APPLIED DEBIT LOGIC: {amount} -> {adjusted_amount}")
                 elif debit_credit.lower() == 'credit' and amount < 0:
-                    adjusted_amount = -amount  # Make credits positive (flip negative to positive)
+                    # CREDIT: Make negative amounts positive
+                    adjusted_amount = -amount
                     if len(data_rows) < 3:
                         logger.info(f"    APPLIED CREDIT LOGIC: {amount} -> {adjusted_amount}")
                 else:
