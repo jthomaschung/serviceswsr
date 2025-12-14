@@ -306,7 +306,7 @@ class WSRParser:
                 week_text = str(df.iloc[0, 2])  # Column C (index 2)
                 if pd.notna(week_text) and week_text != 'nan':
                     try:
-                        week_ending = pd.to_datetime(week_text).strftime('%d-%m-%Y')
+                        week_ending = pd.to_datetime(week_text).strftime('%m/%d/%Y')
                     except:
                         logger.warning(f"Could not parse week ending date: {week_text}")
             
