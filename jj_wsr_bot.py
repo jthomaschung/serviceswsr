@@ -215,30 +215,45 @@ class JimmyJohnsWSRBot:
         try:
             logger.info("Detecting total number of stores...")
             
+            # Wait a bit for page to stabilize
+            page.wait_for_timeout(2000)
+            
             # Open the stores dropdown (we know it's element index 2)
             dropdown_elements = page.locator('input.form-control:visible, [class*="select"]:visible, [class*="dropdown"]:visible').all()
             
+            logger.info(f"Found {len(dropdown_elements)} dropdown elements on page")
+            
             if len(dropdown_elements) >= 3:
-                logger.info(f"Found {len(dropdown_elements)} dropdown elements")
                 # Click element index 2 (the Stores dropdown)
+                logger.info("Clicking Stores dropdown (element 2)...")
                 dropdown_elements[2].click()
-                logger.info("Clicked Stores dropdown (element 2), waiting for checkboxes to appear...")
                 
                 # Wait longer for dropdown to fully load
-                page.wait_for_timeout(3000)
+                logger.info("Waiting for dropdown to open and load checkboxes...")
+                page.wait_for_timeout(4000)  # Increased wait time
                 
-                # Try to wait for checkboxes to appear
-                try:
-                    page.wait_for_selector('input[type="checkbox"]:visible', timeout=5000)
-                except:
-                    logger.warning("Checkboxes didn't appear, trying to click dropdown again...")
-                    # Try clicking again if checkboxes don't appear
-                    dropdown_elements[2].click()
-                    page.wait_for_timeout(2000)
+                # Try multiple selectors to find checkboxes
+                checkbox_selectors = [
+                    'input[type="checkbox"]:visible',
+                    'input[type="checkbox"]',
+                    '[type="checkbox"]:visible',
+                    '[type="checkbox"]'
+                ]
                 
-                # Count checkboxes (excluding "Select All" which is index 0)
-                num_checkboxes = page.locator('input[type="checkbox"]:visible').count()
-                logger.info(f"Found {num_checkboxes} total checkboxes")
+                num_checkboxes = 0
+                for selector in checkbox_selectors:
+                    count = page.locator(selector).count()
+                    if count > num_checkboxes:
+                        num_checkboxes = count
+                        logger.info(f"Found {count} checkboxes using selector: {selector}")
+                
+                if num_checkboxes == 0:
+                    logger.warning("No checkboxes found with any selector!")
+                    # Take screenshot for debugging
+                    page.screenshot(path='no_checkboxes_found.png')
+                    logger.info("Screenshot saved to no_checkboxes_found.png")
+                else:
+                    logger.info(f"Total checkboxes detected: {num_checkboxes}")
                 
                 # Close dropdown
                 page.keyboard.press('Escape')
@@ -247,19 +262,21 @@ class JimmyJohnsWSRBot:
                 # Subtract 1 for "Select All" checkbox
                 num_stores = num_checkboxes - 1 if num_checkboxes > 0 else 0
                 
-                if num_stores == 0:
-                    logger.warning("No stores detected, defaulting to 79 stores based on previous runs")
-                    return 79  # Default based on your successful runs
+                if num_stores == 0 or num_stores < 70:  # If we got a suspiciously low number
+                    logger.warning(f"Detected only {num_stores} stores, which seems too low!")
+                    logger.warning("Defaulting to 79 stores based on known store count")
+                    return 79
                 
-                logger.info(f"Found {num_stores} stores in dropdown")
+                logger.info(f"✓ Successfully detected {num_stores} stores")
                 return num_stores
             else:
-                logger.warning("Could not find enough dropdown elements, defaulting to 79 stores")
-                return 79  # Based on your logs showing 80 checkboxes (79 stores + Select All)
+                logger.warning(f"Could not find enough dropdown elements (found {len(dropdown_elements)}), defaulting to 79 stores")
+                return 79
             
         except Exception as e:
             logger.error(f"Failed to get store count: {e}")
-            return 79  # Default based on your logs
+            logger.warning("Defaulting to 79 stores")
+            return 79
     
     def select_store_batch(self, page: Page, batch_start: int, batch_size: int = 15, total_stores: int = 80) -> int:
         """Select a batch of stores by checkbox index"""
