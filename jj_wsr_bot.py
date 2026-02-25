@@ -210,69 +210,96 @@ class JimmyJohnsWSRBot:
             logger.error(f"Failed to select week: {e}")
             return None
     
+    def open_stores_dropdown(self, page: Page) -> bool:
+        """Find and open the Stores dropdown, waiting up to 10 seconds for it to load."""
+        try:
+            # The Stores dropdown appears after the "Filter By: Store #" dropdown.
+            # Look for it by the red-underline 'Stores' label or by position relative to the label.
+            # Strategy: find the div/container labeled "Stores" and click its dropdown trigger.
+            
+            stores_label = page.locator('text="Stores"').first
+            
+            # Try clicking the dropdown that is a sibling/near the Stores label
+            stores_dropdown = page.locator('[placeholder*="Store"], [aria-label*="Stores"], [class*="multiselect"], [class*="select"]').nth(1)
+
+            # Fallback: find all visible select-like elements and pick the second one
+            # (first is "Filter By: Store #", second is "Stores")
+            candidates = page.locator('div[class*="select"], div[class*="dropdown"], mat-select, ng-select').all()
+            logger.info(f"Found {len(candidates)} select-like elements on page")
+            
+            # The Stores multiselect is typically the last/second select on the page
+            # Try each candidate until we find one that opens a checkbox list
+            clicked = False
+            for idx, candidate in enumerate(candidates):
+                try:
+                    if candidate.is_visible():
+                        candidate.click()
+                        page.wait_for_timeout(500)
+                        if page.locator('input[type="checkbox"]').count() > 1:
+                            logger.info(f"Stores dropdown opened via candidate index {idx}")
+                            clicked = True
+                            break
+                        else:
+                            # This wasn't the right one, close it
+                            page.keyboard.press('Escape')
+                            page.wait_for_timeout(300)
+                except Exception:
+                    continue
+
+            if not clicked:
+                # Last resort: try clicking near the "Stores" text label
+                logger.info("Trying to click near 'Stores' label...")
+                stores_label.click()
+                page.wait_for_timeout(500)
+                if page.locator('input[type="checkbox"]').count() <= 1:
+                    logger.error("Could not open Stores dropdown")
+                    page.screenshot(path='stores_dropdown_failed.png')
+                    return False
+
+            # Now wait up to 10 seconds for checkboxes to fully populate
+            logger.info("Waiting up to 10 seconds for store checkboxes to load...")
+            try:
+                page.wait_for_function(
+                    "document.querySelectorAll('input[type=\"checkbox\"]').length > 10",
+                    timeout=10000
+                )
+            except Exception:
+                pass  # Continue even if timeout, we'll check count below
+
+            num_checkboxes = page.locator('input[type="checkbox"]').count()
+            logger.info(f"Stores dropdown loaded with {num_checkboxes} checkboxes (including Select All)")
+            return num_checkboxes > 1
+
+        except Exception as e:
+            logger.error(f"open_stores_dropdown failed: {e}")
+            return False
+
     def get_all_stores(self, page: Page) -> int:
         """Get count of all available stores by opening the dropdown"""
         try:
             logger.info("Detecting total number of stores...")
-            
-            # Wait a bit for page to stabilize
-            page.wait_for_timeout(2000)
-            
-            # Open the stores dropdown (we know it's element index 2)
-            dropdown_elements = page.locator('input.form-control:visible, [class*="select"]:visible, [class*="dropdown"]:visible').all()
-            
-            logger.info(f"Found {len(dropdown_elements)} dropdown elements on page")
-            
-            if len(dropdown_elements) >= 3:
-                # Click element index 2 (the Stores dropdown)
-                logger.info("Clicking Stores dropdown (element 2)...")
-                dropdown_elements[2].click()
-                
-                # Wait longer for dropdown to fully load
-                logger.info("Waiting for dropdown to open and load checkboxes...")
-                page.wait_for_timeout(4000)  # Increased wait time
-                
-                # Try multiple selectors to find checkboxes
-                checkbox_selectors = [
-                    'input[type="checkbox"]:visible',
-                    'input[type="checkbox"]',
-                    '[type="checkbox"]:visible',
-                    '[type="checkbox"]'
-                ]
-                
-                num_checkboxes = 0
-                for selector in checkbox_selectors:
-                    count = page.locator(selector).count()
-                    if count > num_checkboxes:
-                        num_checkboxes = count
-                        logger.info(f"Found {count} checkboxes using selector: {selector}")
-                
-                if num_checkboxes == 0:
-                    logger.warning("No checkboxes found with any selector!")
-                    # Take screenshot for debugging
-                    page.screenshot(path='no_checkboxes_found.png')
-                    logger.info("Screenshot saved to no_checkboxes_found.png")
-                else:
-                    logger.info(f"Total checkboxes detected: {num_checkboxes}")
-                
-                # Close dropdown
-                page.keyboard.press('Escape')
-                page.wait_for_timeout(500)
-                
-                # Subtract 1 for "Select All" checkbox
-                num_stores = num_checkboxes - 1 if num_checkboxes > 0 else 0
-                
-                if num_stores == 0 or num_stores < 70:  # If we got a suspiciously low number
-                    logger.warning(f"Detected only {num_stores} stores, which seems too low!")
-                    logger.warning("Defaulting to 79 stores based on known store count")
-                    return 79
-                
-                logger.info(f"✓ Successfully detected {num_stores} stores")
-                return num_stores
-            else:
-                logger.warning(f"Could not find enough dropdown elements (found {len(dropdown_elements)}), defaulting to 79 stores")
+
+            if not self.open_stores_dropdown(page):
+                logger.warning("Could not open Stores dropdown, defaulting to 79 stores")
                 return 79
-            
+
+            num_checkboxes = page.locator('input[type="checkbox"]').count()
+            logger.info(f"Total checkboxes detected: {num_checkboxes}")
+
+            # Close dropdown
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(500)
+
+            # Subtract 1 for "Select All" checkbox
+            num_stores = num_checkboxes - 1 if num_checkboxes > 0 else 0
+
+            if num_stores < 70:
+                logger.warning(f"Detected only {num_stores} stores, which seems too low! Defaulting to 79.")
+                return 79
+
+            logger.info(f"Successfully detected {num_stores} stores")
+            return num_stores
+
         except Exception as e:
             logger.error(f"Failed to get store count: {e}")
             logger.warning("Defaulting to 79 stores")
@@ -283,56 +310,47 @@ class JimmyJohnsWSRBot:
         try:
             batch_end = min(batch_start + batch_size, total_stores)
             logger.info(f"Selecting stores {batch_start + 1} to {batch_end} of {total_stores}...")
-            
-            # Open the Stores dropdown (element index 2)
-            dropdown_elements = page.locator('input.form-control:visible, [class*="select"]:visible, [class*="dropdown"]:visible').all()
-            
-            if len(dropdown_elements) >= 3:
-                logger.info("Opening Stores dropdown...")
-                dropdown_elements[2].click()
-                page.wait_for_timeout(2000)
-                
-                # Check if dropdown opened
-                num_checkboxes = page.locator('input[type="checkbox"]:visible').count()
-                if num_checkboxes > 0:
-                    logger.info(f"Found {num_checkboxes} checkboxes")
-                    
-                    # First, uncheck "Select All" if it's checked
-                    select_all = page.locator('input[type="checkbox"]:visible').first
-                    if select_all.is_checked():
-                        select_all.click()
-                        page.wait_for_timeout(500)
-                        logger.info("Unchecked 'Select All'")
-                    
-                    # Get all checkboxes
-                    all_checkboxes = page.locator('input[type="checkbox"]:visible').all()
-                    
-                    selected_count = 0
-                    # Select stores in this batch (skip index 0 which is "Select All")
-                    for i in range(batch_start + 1, min(batch_end + 1, len(all_checkboxes))):
-                        try:
-                            checkbox = all_checkboxes[i]
-                            if not checkbox.is_checked():
-                                checkbox.click()
-                                selected_count += 1
-                                logger.info(f"Selected store at index {i}")
-                                page.wait_for_timeout(100)  # Small delay between selections
-                        except Exception as e:
-                            logger.warning(f"Failed to select store at index {i}: {e}")
-                    
-                    # Close dropdown
-                    page.keyboard.press('Escape')
-                    page.wait_for_timeout(500)
-                    
-                    logger.info(f"Selected {selected_count} stores in this batch")
-                    return selected_count
-                else:
-                    logger.error("No checkboxes found after opening dropdown")
-                    return 0
-            else:
+
+            if not self.open_stores_dropdown(page):
                 logger.error("Could not find Stores dropdown")
                 return 0
-                
+
+            num_checkboxes = page.locator('input[type="checkbox"]').count()
+            logger.info(f"Found {num_checkboxes} checkboxes")
+
+            if num_checkboxes == 0:
+                logger.error("No checkboxes found after opening dropdown")
+                return 0
+
+            # First, uncheck "Select All" if it's checked
+            select_all = page.locator('input[type="checkbox"]').first
+            if select_all.is_checked():
+                select_all.click()
+                page.wait_for_timeout(500)
+                logger.info("Unchecked 'Select All'")
+
+            # Get all checkboxes
+            all_checkboxes = page.locator('input[type="checkbox"]').all()
+
+            selected_count = 0
+            # Select stores in this batch (skip index 0 which is "Select All")
+            for i in range(batch_start + 1, min(batch_end + 1, len(all_checkboxes))):
+                try:
+                    checkbox = all_checkboxes[i]
+                    if not checkbox.is_checked():
+                        checkbox.click()
+                        selected_count += 1
+                        page.wait_for_timeout(100)
+                except Exception as e:
+                    logger.warning(f"Failed to select store at index {i}: {e}")
+
+            # Close dropdown by clicking outside
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(500)
+
+            logger.info(f"Selected {selected_count} stores in this batch")
+            return selected_count
+
         except Exception as e:
             logger.error(f"Failed to select store batch: {e}")
             page.screenshot(path='store_selection_error.png')
@@ -412,7 +430,7 @@ class JimmyJohnsWSRBot:
             with sync_playwright() as p:
                 # Launch browser
                 browser = p.chromium.launch(
-                    headless=True,  # Required for GitHub Actions
+                    headless=False,  # Required for GitHub Actions
                     args=['--disable-blink-features=AutomationControlled']
                 )
                 
@@ -466,15 +484,20 @@ class JimmyJohnsWSRBot:
                         
                         logger.info(f"\n--- Batch {batch_num + 1} of {num_batches} ---")
                         
-                        # Clear any previous selections by reloading page if not first batch
+                        # For batches after the first, reload to clear previous selections
                         if batch_num > 0:
                             logger.info("Reloading page for next batch...")
                             page.reload()
-                            page.wait_for_timeout(3000)
+                            page.wait_for_load_state('networkidle', timeout=30000)
+                            page.wait_for_timeout(2000)
                             
                             # Re-select week after reload
                             self.select_reporting_week(page, week_offset)
                             page.wait_for_timeout(1000)
+
+                            # Wait for the Stores dropdown to be ready (up to 10s)
+                            logger.info("Waiting for Stores dropdown to be available after reload...")
+                            page.wait_for_timeout(10000)
                         
                         # Select stores for this batch
                         num_selected = self.select_store_batch(page, batch_start, batch_size, total_stores)
@@ -493,7 +516,7 @@ class JimmyJohnsWSRBot:
                                 logger.info("Waiting 10 seconds before next batch...")
                                 time.sleep(10)
                         else:
-                            logger.warning(f"No stores selected for batch {batch_num + 1}, skipping download")
+                            logger.warning(f"No stores selected for batch {batch_num + 1}, skipping download and reload")
                 
                 # Keep browser open for a moment for debugging
                 logger.info("Keeping browser open for 10 seconds for debugging...")
