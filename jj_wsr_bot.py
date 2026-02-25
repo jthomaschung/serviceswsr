@@ -430,7 +430,7 @@ class JimmyJohnsWSRBot:
             with sync_playwright() as p:
                 # Launch browser
                 browser = p.chromium.launch(
-                    headless=False,  # Required for GitHub Actions
+                    headless=True,  # Required for GitHub Actions
                     args=['--disable-blink-features=AutomationControlled']
                 )
                 
@@ -547,3 +547,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
