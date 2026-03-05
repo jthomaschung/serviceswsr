@@ -519,27 +519,50 @@ class JimmyJohnsWSRBot:
                 logger.info(f"Total stores: {total_stores} | Batches: {num_batches}")
 
                 # ── Initial download pass ──────────────────────────────────
+                BATCH_MAX_ATTEMPTS = 3
+
                 for batch_num in range(num_batches):
                     batch_start = batch_num * batch_size
                     logger.info(f"\n--- Batch {batch_num + 1} of {num_batches} ---")
 
-                    if batch_num > 0:
-                        page.reload()
-                        page.wait_for_load_state('networkidle', timeout=30000)
-                        page.wait_for_timeout(2000)
-                        self.select_reporting_week(page, week_offset)
-                        page.wait_for_timeout(10000)
+                    batch_success = False
 
-                    num_selected = self.select_store_batch(page, batch_start, batch_size, total_stores)
+                    for attempt in range(1, BATCH_MAX_ATTEMPTS + 1):
+                        if attempt > 1:
+                            logger.warning(f"  Batch {batch_num + 1} attempt {attempt}/{BATCH_MAX_ATTEMPTS}...")
 
-                    if num_selected > 0:
+                        # Reload and re-select week before every attempt
+                        # (always reload so state is clean, skip only on very first attempt of first batch)
+                        if batch_num > 0 or attempt > 1:
+                            page.reload()
+                            page.wait_for_load_state('networkidle', timeout=30000)
+                            page.wait_for_timeout(2000)
+                            self.select_reporting_week(page, week_offset)
+                            page.wait_for_timeout(10000)
+
+                        num_selected = self.select_store_batch(page, batch_start, batch_size, total_stores)
+
+                        if num_selected == 0:
+                            logger.warning(f"  No stores selected on attempt {attempt}")
+                            continue
+
                         filepath = self.download_wsr_export(page, selected_week, batch_num + 1)
-                        if not filepath:
-                            logger.warning(f"Batch {batch_num + 1} download failed")
-                        if batch_num < num_batches - 1:
-                            time.sleep(10)
-                    else:
-                        logger.warning(f"No stores selected for batch {batch_num + 1}, skipping")
+
+                        if filepath:
+                            batch_success = True
+                            break
+                        else:
+                            logger.warning(f"  Download failed on attempt {attempt}")
+
+                    if not batch_success:
+                        raise Exception(
+                            f"Batch {batch_num + 1} failed after {BATCH_MAX_ATTEMPTS} attempts "
+                            f"(stores {batch_start + 1}–{min(batch_start + batch_size, total_stores)}). "
+                            f"Aborting run."
+                        )
+
+                    if batch_num < num_batches - 1:
+                        time.sleep(10)
 
                 # ── Audit ─────────────────────────────────────────────────
                 missing = self.audit_week_downloads(week_str)
