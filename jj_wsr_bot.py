@@ -281,7 +281,7 @@ class JimmyJohnsWSRBot:
             logger.error(f"Failed to get store count: {e}")
             return 79
 
-    def select_store_batch(self, page: Page, batch_start: int, batch_size: int = 10, total_stores: int = 80) -> int:
+    def select_store_batch(self, page: Page, batch_start: int, batch_size: int = 5, total_stores: int = 80) -> int:
         """Select a batch of stores by checkbox index"""
         try:
             batch_end = min(batch_start + batch_size, total_stores)
@@ -433,7 +433,7 @@ class JimmyJohnsWSRBot:
         logger.info(f"{'='*60}")
 
         missing_list = sorted(missing_stores)
-        batch_size = 10
+        batch_size = 5
         num_batches = (len(missing_list) + batch_size - 1) // batch_size
 
         for batch_num in range(num_batches):
@@ -514,7 +514,7 @@ class JimmyJohnsWSRBot:
                     logger.error("No stores found")
                     continue
 
-                batch_size = 10
+                batch_size = 5
                 num_batches = (total_stores + batch_size - 1) // batch_size
                 logger.info(f"Total stores: {total_stores} | Batches: {num_batches}")
 
@@ -595,4 +595,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
