@@ -379,42 +379,49 @@ class JimmyJohnsWSRBot:
 
     def download_wsr_export(self, page: Page, week: str, batch_num: int) -> Optional[str]:
         """Download the WSR export file"""
+        logger.info(f"Starting download for batch {batch_num}...")
+
+        export_button = page.locator('button:has-text("EXPORT")')
+        if export_button.count() == 0:
+            logger.error("Could not find EXPORT button")
+            return None
+
+        # Wrap expect_download separately so a TimeoutError returns None
+        # cleanly instead of bubbling up past the batch retry loop
         try:
-            logger.info(f"Starting download for batch {batch_num}...")
+            with page.expect_download(timeout=120000) as download_info:
+                export_button.click()
+                logger.info("Clicked EXPORT — waiting up to 2 minutes...")
+        except Exception as e:
+            logger.error(f"Download timed out or failed waiting for file: {e}")
+            return None
 
-            export_button = page.locator('button:has-text("EXPORT")')
-            if export_button.count() > 0:
-                with page.expect_download(timeout=120000) as download_info:
-                    export_button.click()
-                    logger.info("Clicked EXPORT — waiting up to 2 minutes...")
+        try:
+            download = download_info.value
+            suggested_filename = download.suggested_filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            week_str = week.replace('/', '-') if week else "unknown"
+            extension = Path(suggested_filename).suffix if suggested_filename else '.zip'
+            filename = f"WSR_Export_{week_str}_Batch{batch_num}_{timestamp}{extension}"
 
-                download = download_info.value
-                suggested_filename = download.suggested_filename
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                week_str = week.replace('/', '-') if week else "unknown"
-                extension = Path(suggested_filename).suffix if suggested_filename else '.zip'
-                filename = f"WSR_Export_{week_str}_Batch{batch_num}_{timestamp}{extension}"
+            save_path = self.download_dir / filename
+            download.save_as(save_path)
 
-                save_path = self.download_dir / filename
-                download.save_as(save_path)
+            processed_path = self.processed_dir / filename
+            save_path.rename(processed_path)
 
-                processed_path = self.processed_dir / filename
-                save_path.rename(processed_path)
+            file_size = processed_path.stat().st_size
+            logger.info(f"Saved: {filename} ({file_size:,} bytes)")
 
-                file_size = processed_path.stat().st_size
-                logger.info(f"Saved: {filename} ({file_size:,} bytes)")
-
-                if file_size < 1000:
-                    logger.warning("File too small — may be corrupt")
-
-                self.downloaded_files.append(processed_path)
-                return str(processed_path)
-            else:
-                logger.error("Could not find EXPORT button")
+            if file_size < 1000:
+                logger.warning("File too small — may be corrupt")
                 return None
 
+            self.downloaded_files.append(processed_path)
+            return str(processed_path)
+
         except Exception as e:
-            logger.error(f"Failed to download export: {e}")
+            logger.error(f"Failed to save downloaded file: {e}")
             return None
 
     # =========================================================================
