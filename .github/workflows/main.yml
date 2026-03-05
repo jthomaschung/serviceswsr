@@ -40,7 +40,7 @@ jobs:
           cat > .env << EOF
           JJ_EMAIL=${{ secrets.JJ_EMAIL }}
           JJ_PASSWORD=${{ secrets.JJ_PASSWORD }}
-          WEEKS_TO_DOWNLOAD=3
+          WEEKS_TO_DOWNLOAD=1
           DOWNLOAD_DIR=./downloads
           PROCESSED_DIR=./processed
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
