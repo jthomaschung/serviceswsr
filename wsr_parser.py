@@ -546,6 +546,14 @@ class WSRParser:
                 except:
                     amount = 0.0
 
+                # Guard against numeric overflow (Supabase field is precision 10, scale 2)
+                if abs(amount) >= 100_000_000:
+                    logger.warning(
+                        f"Overflow value {amount} skipped for '{sales_item_str}' "
+                        f"store {store_number} — setting to 0.0"
+                    )
+                    amount = 0.0
+
                 records.append({
                     'store_number': store_number,
                     'store_name': store_name,
@@ -865,6 +873,7 @@ def main():
         sys.exit(1)
 
     overall_success = True
+    unique_weeks = []
 
     # ========================================================================
     # PART 1: WSR LINE-ITEM DATA
@@ -924,11 +933,6 @@ def main():
                 # ── Google Sheets ─────────────────────────────────────────
                 parser.create_google_sheets_tabs(all_wsr_records)
 
-                # ── Supabase verification ─────────────────────────────────
-                wsr_verified = parser.verify_supabase_upload(unique_weeks)
-                if not wsr_verified:
-                    overall_success = False
-
             else:
                 logger.warning("No WSR records extracted")
                 overall_success = False
@@ -964,6 +968,14 @@ def main():
     else:
         logger.warning("No expected deposits data extracted")
         overall_success = False
+
+    # ========================================================================
+    # SUPABASE VERIFICATION — runs after both parts complete
+    # ========================================================================
+    if unique_weeks:
+        verified = parser.verify_supabase_upload(unique_weeks)
+        if not verified:
+            overall_success = False
 
     # ========================================================================
     # FINAL SUMMARY
