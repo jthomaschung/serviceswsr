@@ -210,15 +210,29 @@ class WSRParser:
 
             # ── services_wsr ──────────────────────────────────────────────
             try:
-                resp = (
-                    self.supabase.table('services_wsr')
-                    .select('store_number', count='exact')
-                    .eq('week_ending', week)
-                    .execute()
-                )
-                total_rows = resp.count or len(resp.data)
-                unique_stores = len(set(r['store_number'] for r in resp.data))
+                # Paginate through all rows — Supabase caps at 1000 by default
+                all_store_numbers = []
+                page_size = 1000
+                offset = 0
+                total_rows = 0
 
+                while True:
+                    resp = (
+                        self.supabase.table('services_wsr')
+                        .select('store_number', count='exact')
+                        .eq('week_ending', week)
+                        .range(offset, offset + page_size - 1)
+                        .execute()
+                    )
+                    batch = resp.data or []
+                    all_store_numbers.extend(r['store_number'] for r in batch)
+                    if total_rows == 0:
+                        total_rows = resp.count or 0
+                    if len(batch) < page_size:
+                        break
+                    offset += page_size
+
+                unique_stores = len(set(all_store_numbers))
                 avg = total_rows / unique_stores if unique_stores else 0
                 wsr_ok = unique_stores >= len(EXPECTED_STORES) and avg >= 20
 
