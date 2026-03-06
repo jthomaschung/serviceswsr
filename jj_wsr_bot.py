@@ -1,41 +1,37 @@
 """
-WSR Parser - ENHANCED VERSION with Parse Audit & Supabase Verification
-Processes Jimmy John's Weekly Sales Reports AND Expected Deposits
-Uploads to Supabase and creates Google Sheets tabs by Legal Entity
+Jimmy John's WSR Export Bot - with Download Audit & Retry
+Automates downloading WSR (Weekly Sales Report) exports from Jimmy John's portal
 """
 
 import os
-import sys
-import pandas as pd
-import numpy as np
-from datetime import datetime
-import datetime as dt
-from pathlib import Path
-from dotenv import load_dotenv
-import logging
-from typing import List, Dict, Any, Optional, Set
 import re
+import time
+import logging
 import zipfile
-import shutil
-import openpyxl
+import pandas as pd
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Optional, Set
+import json
+from playwright.sync_api import sync_playwright, Page, Download
+from dotenv import load_dotenv
 
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from supabase import create_client, Client
+# Load environment variables
+load_dotenv()
 
+# Configure logging with UTF-8 encoding to handle special characters
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('wsr_parser.log', encoding='utf-8'),
+        logging.FileHandler('jj_wsr_bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Full expected store list — keep in sync with jj_wsr_bot.py
-EXPECTED_STORES: Set[int] = {
+# Full expected store list — update if fleet changes
+EXPECTED_STORES = {
     522, 746, 799, 833, 838, 877, 930, 965, 1002, 1018, 1019, 1061, 1111,
     1127, 1206, 1261, 1307, 1337, 1342, 1355, 1440, 1441, 1554, 1556, 1562,
     1635, 1694, 1695, 1696, 1762, 1779, 1789, 1955, 1956, 1957, 2006, 2021,
@@ -45,965 +41,591 @@ EXPECTED_STORES: Set[int] = {
     4022, 4024, 4105, 4330, 4358, 4586,
 }
 
-MAX_PARSE_RETRIES = 2   # How many times to retry parsing a failing file
+MAX_RETRY_ATTEMPTS = 2  # How many times to retry missing stores after initial run
 
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def _to_iso_date(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    if isinstance(x, dt.datetime):
-        return x.date().isoformat()
-    if isinstance(x, dt.date):
-        return x.isoformat()
-    if isinstance(x, float):
-        return None
-    if isinstance(x, str):
-        s = x.strip()
-        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
-        if m:
-            mm, dd, yyyy = m.groups()
-            return f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
-        m2 = re.match(r"^\d{4}-\d{2}-\d{2}$", s)
-        if m2:
-            return s
-        return s
-    return str(x).strip()
-
-
-def _to_float(x: Any) -> Optional[float]:
-    if x is None:
-        return 0.0
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip().replace(",", "")
-    if s == "":
-        return 0.0
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-# ============================================================================
-# MAIN PARSER CLASS
-# ============================================================================
-
-class WSRParser:
+class JimmyJohnsWSRBot:
+    """Bot for downloading WSR reports from Jimmy John's Macromatix portal"""
 
     def __init__(self):
-        load_dotenv()
+        self.start_url = "https://prod-services.jimmyjohns.com/pages/aspx/dashboard/"
+        self.email = os.getenv('JJ_EMAIL')
+        self.password = os.getenv('JJ_PASSWORD')
+        self.download_dir = Path(os.getenv('DOWNLOAD_DIR', './downloads'))
+        self.processed_dir = Path(os.getenv('PROCESSED_DIR', './processed'))
+        self.download_dir.mkdir(exist_ok=True)
+        self.processed_dir.mkdir(exist_ok=True)
+        self.database_url = os.getenv('DATABASE_URL')
+        self.downloaded_files = []
 
-        self.supabase_url = os.getenv('SUPABASE_URL')
-        self.supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+    # =========================================================================
+    # AUDIT HELPERS
+    # =========================================================================
 
-        if self.supabase_url and self.supabase_key:
-            self.supabase = create_client(self.supabase_url, self.supabase_key)
-            logger.info("Supabase client initialized")
-        else:
-            self.supabase = None
-            logger.warning("Supabase credentials not found - will skip upload")
+    def get_downloaded_stores_for_week(self, week_str: str) -> Set[int]:
+        """
+        Scan the processed directory for ZIP files matching week_str and return
+        the set of store numbers found inside them.
 
-        self.spreadsheet_id = os.getenv('GOOGLE_SHEET_ID')
-        self.credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH')
+        week_str format matches the ZIP filename, e.g. '03-03-2026'.
+        """
+        found_stores: Set[int] = set()
 
-        if self.spreadsheet_id and self.credentials_path and os.path.exists(self.credentials_path):
+        for zip_path in self.processed_dir.glob(f"WSR_Export_{week_str}_*.zip"):
             try:
-                scopes = ['https://www.googleapis.com/auth/spreadsheets']
-                creds = Credentials.from_service_account_file(self.credentials_path, scopes=scopes)
-                self.sheets_service = build('sheets', 'v4', credentials=creds)
-                logger.info("Google Sheets API initialized")
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    for name in zf.namelist():
+                        # Files are named like "#3030 03-03-26.xls"
+                        m = re.match(r'#(\d+)\s', name)
+                        if m:
+                            found_stores.add(int(m.group(1)))
             except Exception as e:
-                logger.error(f"Failed to initialize Google Sheets: {e}")
-                self.sheets_service = None
-        else:
-            self.sheets_service = None
-            logger.warning("Google Sheets not configured")
+                logger.warning(f"Could not inspect ZIP {zip_path.name}: {e}")
 
-        self.store_mapping = self.load_store_mapping()
-        self.batch_size = 1000
-        self.account_mapping = self.load_account_mapping()
-        self.expected_deposits_table = os.getenv('EXPECTED_DEPOSITS_TABLE', 'weekly_sales_expected')
+        return found_stores
 
-    # ========================================================================
-    # AUDIT & VERIFICATION
-    # ========================================================================
-
-    def audit_parsed_records(self, records: List[Dict], label: str = "WSR") -> Set[int]:
+    def audit_week_downloads(self, week_str: str) -> Set[int]:
         """
-        Compare store numbers in parsed records against EXPECTED_STORES.
-        Returns the set of missing store numbers.
+        Compare downloaded stores against EXPECTED_STORES.
+        Returns the set of missing store numbers (empty = all good).
         """
-        parsed_stores = set(int(r['store_number']) for r in records if r.get('store_number'))
-        missing = EXPECTED_STORES - parsed_stores
+        downloaded = self.get_downloaded_stores_for_week(week_str)
+        missing = EXPECTED_STORES - downloaded
 
         logger.info(f"\n{'─'*60}")
-        logger.info(f"PARSE AUDIT — {label}")
+        logger.info(f"DOWNLOAD AUDIT — week {week_str}")
         logger.info(f"  Expected : {len(EXPECTED_STORES)} stores")
-        logger.info(f"  Parsed   : {len(parsed_stores)} stores")
+        logger.info(f"  Downloaded: {len(downloaded)} stores")
 
         if missing:
             logger.warning(f"  ⚠️  MISSING {len(missing)} stores: {sorted(missing)}")
         else:
-            logger.info(f"  ✓ All stores parsed successfully")
+            logger.info(f"  ✓ All stores accounted for")
 
         return missing
 
-    def audit_expected_deposits(self, records: List[Dict]) -> Dict[str, Any]:
-        """
-        Audit expected deposits records.
-        Returns a dict with missing stores and days-per-store issues.
-        """
-        issues = {"missing_stores": set(), "incomplete_days": {}}
+    # =========================================================================
+    # LOGIN / NAVIGATION  (unchanged from original)
+    # =========================================================================
 
-        if not records:
-            issues["missing_stores"] = EXPECTED_STORES
-            return issues
+    def login(self, page: Page) -> bool:
+        """Handle login if needed"""
+        try:
+            logger.info("Navigating to Jimmy John's portal...")
+            page.goto(self.start_url, wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(2000)
 
-        from collections import defaultdict
-        store_days: Dict[str, Set[str]] = defaultdict(set)
-        for r in records:
-            sn = str(r.get('store_number', ''))
-            d = r.get('date', '')
-            if sn and d:
-                store_days[sn].add(d)
+            if "dashboard" in page.url.lower() and page.locator('text="MY DASHBOARD"').count() > 0:
+                logger.info("Already logged in!")
+                return True
 
-        parsed_stores = set(int(sn) for sn in store_days.keys() if sn.isdigit())
-        issues["missing_stores"] = EXPECTED_STORES - parsed_stores
+            if page.locator('input[type="email"], input[type="text"]').count() > 0:
+                logger.info("Login required, entering credentials...")
+                email_input = page.locator('input[type="email"], input[type="text"]').first
+                email_input.fill(self.email)
 
-        for sn, days in store_days.items():
-            if len(days) < 7:
-                issues["incomplete_days"][sn] = len(days)
+                if page.locator('button:has-text("NEXT")').count() > 0:
+                    page.locator('button:has-text("NEXT")').click()
+                    page.wait_for_timeout(2000)
 
-        logger.info(f"\n{'─'*60}")
-        logger.info(f"EXPECTED DEPOSITS AUDIT")
-        logger.info(f"  Stores with data : {len(parsed_stores)}")
-        if issues["missing_stores"]:
-            logger.warning(f"  ⚠️  Missing stores: {sorted(issues['missing_stores'])}")
-        if issues["incomplete_days"]:
-            logger.warning(f"  ⚠️  Stores with <7 days: {issues['incomplete_days']}")
-        if not issues["missing_stores"] and not issues["incomplete_days"]:
-            logger.info(f"  ✓ All stores have 7 days of expected deposits")
+                password_input = page.locator('input[type="password"]').first
+                password_input.fill(self.password)
 
-        return issues
+                for selector in ['button:has-text("SIGN IN")', 'button:has-text("Sign In")',
+                                  'button:has-text("Login")', 'button[type="submit"]']:
+                    if page.locator(selector).count() > 0:
+                        page.locator(selector).first.click(timeout=60000, no_wait_after=True)
+                        break
 
-    def verify_supabase_upload(self, week_endings: List[str]) -> bool:
-        """
-        Query Supabase after upload to confirm row counts look correct.
-        Returns True if all checks pass.
-        """
-        if not self.supabase:
-            logger.warning("Supabase not configured — skipping verification")
+                # Portal can be slow to redirect after sign-in
+                try:
+                    page.wait_for_load_state('networkidle', timeout=60000)
+                except Exception:
+                    pass  # Fall through to URL check below
+                page.wait_for_timeout(5000)
+
+            if "dashboard" in page.url.lower() or page.locator('text="MY DASHBOARD"').count() > 0:
+                logger.info("Successfully on dashboard!")
+                return True
+            else:
+                logger.error(f"Login failed. Current URL: {page.url}")
+                page.screenshot(path='login_failed.png')
+                return False
+
+        except Exception as e:
+            logger.error(f"Login process failed: {e}")
+            page.screenshot(path='login_error.png')
+            return False
+
+    def navigate_to_wsr_export(self, page: Page) -> bool:
+        """Navigate to WSR Export page"""
+        try:
+            logger.info("Looking for Sales Reports link...")
+            sales_reports = page.locator('text="Sales Reports"')
+            if sales_reports.count() > 0:
+                sales_reports.click()
+                page.wait_for_load_state('networkidle', timeout=15000)
+                page.wait_for_timeout(2000)
+
+                for selector in ['text="WSR EXPORT"', 'text="WSR Export"',
+                                  'a:has-text("WSR")', '*:has-text("WSR EXPORT")']:
+                    if page.locator(selector).count() > 0:
+                        page.locator(selector).first.click()
+                        page.wait_for_load_state('networkidle', timeout=10000)
+                        page.wait_for_timeout(2000)
+
+                        if page.locator('text="Select Reporting Week Ending Date"').count() > 0:
+                            logger.info("Successfully on WSR Export page")
+                            return True
+                        break
+
+                if page.locator('text="Select Reporting Week Ending Date"').count() == 0:
+                    logger.error("Could not find WSR Export page elements")
+                    page.screenshot(path='wsr_navigation_failed.png')
+                    return False
+            else:
+                logger.error("Could not find Sales Reports link")
+                page.screenshot(path='sales_reports_not_found.png')
+                return False
+
             return True
 
+        except Exception as e:
+            logger.error(f"Failed to navigate to WSR Export: {e}")
+            page.screenshot(path='navigation_error.png')
+            return False
+
+    def select_reporting_week(self, page: Page, week_offset: int = 0) -> str:
+        """Select reporting week (0 = most recent, 1 = previous week, etc.)"""
+        try:
+            week_dropdown = page.locator('text="Select Reporting Week Ending Date"').locator('xpath=following-sibling::*').first
+            week_dropdown.click()
+            page.wait_for_timeout(1000)
+
+            week_options = page.locator('[role="option"]').all()
+            if not week_options:
+                week_options = page.locator('.dropdown-item').all()
+
+            if week_offset < len(week_options):
+                selected_week = week_options[week_offset].text_content()
+                week_options[week_offset].click()
+                logger.info(f"Selected week: {selected_week}")
+                return selected_week
+            else:
+                logger.error(f"Week offset {week_offset} out of range")
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to select week: {e}")
+            return None
+
+    def open_stores_dropdown(self, page: Page) -> bool:
+        """Find and open the Stores dropdown"""
+        try:
+            candidates = page.locator('div[class*="select"], div[class*="dropdown"], mat-select, ng-select').all()
+            logger.info(f"Found {len(candidates)} select-like elements on page")
+
+            clicked = False
+            for idx, candidate in enumerate(candidates):
+                try:
+                    if candidate.is_visible():
+                        candidate.click()
+                        page.wait_for_timeout(500)
+                        if page.locator('input[type="checkbox"]').count() > 1:
+                            logger.info(f"Stores dropdown opened via candidate index {idx}")
+                            clicked = True
+                            break
+                        else:
+                            page.keyboard.press('Escape')
+                            page.wait_for_timeout(300)
+                except Exception:
+                    continue
+
+            if not clicked:
+                page.locator('text="Stores"').first.click()
+                page.wait_for_timeout(500)
+                if page.locator('input[type="checkbox"]').count() <= 1:
+                    logger.error("Could not open Stores dropdown")
+                    page.screenshot(path='stores_dropdown_failed.png')
+                    return False
+
+            try:
+                page.wait_for_function(
+                    "document.querySelectorAll('input[type=\"checkbox\"]').length > 10",
+                    timeout=10000
+                )
+            except Exception:
+                pass
+
+            num_checkboxes = page.locator('input[type="checkbox"]').count()
+            logger.info(f"Stores dropdown loaded with {num_checkboxes} checkboxes")
+            return num_checkboxes > 1
+
+        except Exception as e:
+            logger.error(f"open_stores_dropdown failed: {e}")
+            return False
+
+    def get_all_stores(self, page: Page) -> int:
+        """Get count of all available stores"""
+        try:
+            if not self.open_stores_dropdown(page):
+                return 79
+
+            num_checkboxes = page.locator('input[type="checkbox"]').count()
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(500)
+
+            num_stores = num_checkboxes - 1 if num_checkboxes > 0 else 0
+            if num_stores < 70:
+                logger.warning(f"Only {num_stores} stores detected, defaulting to 79")
+                return 79
+
+            return num_stores
+
+        except Exception as e:
+            logger.error(f"Failed to get store count: {e}")
+            return 79
+
+    def select_store_batch(self, page: Page, batch_start: int, batch_size: int = 5, total_stores: int = 80) -> int:
+        """Select a batch of stores by checkbox index"""
+        try:
+            batch_end = min(batch_start + batch_size, total_stores)
+            logger.info(f"Selecting stores {batch_start + 1} to {batch_end} of {total_stores}...")
+
+            if not self.open_stores_dropdown(page):
+                return 0
+
+            all_checkboxes = page.locator('input[type="checkbox"]').all()
+            if not all_checkboxes:
+                return 0
+
+            select_all = all_checkboxes[0]
+            if select_all.is_checked():
+                select_all.click()
+                page.wait_for_timeout(500)
+
+            selected_count = 0
+            for i in range(batch_start + 1, min(batch_end + 1, len(all_checkboxes))):
+                try:
+                    if not all_checkboxes[i].is_checked():
+                        all_checkboxes[i].click()
+                        selected_count += 1
+                        page.wait_for_timeout(100)
+                except Exception as e:
+                    logger.warning(f"Failed to select store at index {i}: {e}")
+
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(500)
+            logger.info(f"Selected {selected_count} stores in this batch")
+            return selected_count
+
+        except Exception as e:
+            logger.error(f"Failed to select store batch: {e}")
+            return 0
+
+    def select_specific_stores_by_number(self, page: Page, store_numbers: Set[int]) -> int:
+        """
+        Select specific stores by matching their store number in the checkbox label.
+        Used for retry runs targeting only the missing stores.
+        """
+        try:
+            logger.info(f"Selecting {len(store_numbers)} specific stores: {sorted(store_numbers)}")
+
+            if not self.open_stores_dropdown(page):
+                return 0
+
+            all_checkboxes = page.locator('input[type="checkbox"]').all()
+            if not all_checkboxes:
+                return 0
+
+            # Uncheck Select All if checked
+            if all_checkboxes[0].is_checked():
+                all_checkboxes[0].click()
+                page.wait_for_timeout(500)
+
+            selected_count = 0
+            # Each checkbox should have an associated label — try to read it
+            # Labels are typically in a sibling or parent element
+            checkbox_locators = page.locator('input[type="checkbox"]').all()
+
+            for i, cb in enumerate(checkbox_locators[1:], start=1):  # skip Select All
+                try:
+                    # Get the text near this checkbox (parent li or label)
+                    label_text = page.evaluate(
+                        """(el) => {
+                            const parent = el.closest('li') || el.parentElement;
+                            return parent ? parent.textContent.trim() : '';
+                        }""",
+                        cb.element_handle()
+                    )
+
+                    # Extract store number from label text (e.g. "#3030" or "3030")
+                    m = re.search(r'#?(\d{3,5})', label_text)
+                    if m:
+                        store_num = int(m.group(1))
+                        if store_num in store_numbers:
+                            if not cb.is_checked():
+                                cb.click()
+                                selected_count += 1
+                                page.wait_for_timeout(100)
+                                logger.info(f"  ✓ Selected store {store_num}")
+                except Exception as e:
+                    logger.warning(f"Could not read label for checkbox {i}: {e}")
+                    continue
+
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(500)
+            logger.info(f"Selected {selected_count} of {len(store_numbers)} targeted stores")
+            return selected_count
+
+        except Exception as e:
+            logger.error(f"select_specific_stores_by_number failed: {e}")
+            return 0
+
+    def download_wsr_export(self, page: Page, week: str, batch_num: int) -> Optional[str]:
+        """Download the WSR export file"""
+        logger.info(f"Starting download for batch {batch_num}...")
+
+        export_button = page.locator('button:has-text("EXPORT")')
+        if export_button.count() == 0:
+            logger.error("Could not find EXPORT button")
+            return None
+
+        # Wrap expect_download separately so a TimeoutError returns None
+        # cleanly instead of bubbling up past the batch retry loop
+        try:
+            with page.expect_download(timeout=120000) as download_info:
+                export_button.click()
+                logger.info("Clicked EXPORT — waiting up to 2 minutes...")
+        except Exception as e:
+            logger.error(f"Download timed out or failed waiting for file: {e}")
+            return None
+
+        try:
+            download = download_info.value
+            suggested_filename = download.suggested_filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            week_str = week.replace('/', '-') if week else "unknown"
+            extension = Path(suggested_filename).suffix if suggested_filename else '.zip'
+            filename = f"WSR_Export_{week_str}_Batch{batch_num}_{timestamp}{extension}"
+
+            save_path = self.download_dir / filename
+            download.save_as(save_path)
+
+            processed_path = self.processed_dir / filename
+            save_path.rename(processed_path)
+
+            file_size = processed_path.stat().st_size
+            logger.info(f"Saved: {filename} ({file_size:,} bytes)")
+
+            if file_size < 1000:
+                logger.warning("File too small — may be corrupt")
+                return None
+
+            self.downloaded_files.append(processed_path)
+            return str(processed_path)
+
+        except Exception as e:
+            logger.error(f"Failed to save downloaded file: {e}")
+            return None
+
+    # =========================================================================
+    # RETRY LOGIC
+    # =========================================================================
+
+    def retry_missing_stores(self, page: Page, week_offset: int,
+                              selected_week: str, missing_stores: Set[int],
+                              week_str: str) -> Set[int]:
+        """
+        Attempt to download only the missing stores.
+        Downloads them in batches of 15 and returns any still-missing stores after.
+        """
         logger.info(f"\n{'='*60}")
-        logger.info("SUPABASE UPLOAD VERIFICATION")
+        logger.info(f"RETRY — downloading {len(missing_stores)} missing stores")
         logger.info(f"{'='*60}")
 
-        all_passed = True
+        missing_list = sorted(missing_stores)
+        batch_size = 5
+        num_batches = (len(missing_list) + batch_size - 1) // batch_size
 
-        for week in week_endings:
-            logger.info(f"\n  Week: {week}")
+        for batch_num in range(num_batches):
+            batch_stores = set(missing_list[batch_num * batch_size:(batch_num + 1) * batch_size])
+            logger.info(f"\n--- Retry Batch {batch_num + 1} of {num_batches}: {sorted(batch_stores)} ---")
 
-            # ── services_wsr ──────────────────────────────────────────────
-            try:
-                # Paginate through all rows — Supabase caps at 1000 by default
-                all_store_numbers = []
-                page_size = 1000
-                offset = 0
-                total_rows = 0
+            # Reload page and re-select week
+            page.reload()
+            page.wait_for_load_state('networkidle', timeout=30000)
+            page.wait_for_timeout(3000)
+            self.select_reporting_week(page, week_offset)
+            page.wait_for_timeout(10000)
 
-                while True:
-                    resp = (
-                        self.supabase.table('services_wsr')
-                        .select('store_number', count='exact')
-                        .eq('week_ending', week)
-                        .range(offset, offset + page_size - 1)
-                        .execute()
+            num_selected = self.select_specific_stores_by_number(page, batch_stores)
+
+            if num_selected > 0:
+                filepath = self.download_wsr_export(page, selected_week, f"Retry{batch_num + 1}")
+                if filepath:
+                    logger.info(f"✓ Retry batch {batch_num + 1} downloaded")
+                else:
+                    logger.warning(f"Retry batch {batch_num + 1} download failed")
+
+                if batch_num < num_batches - 1:
+                    time.sleep(10)
+            else:
+                logger.warning(f"Could not select stores for retry batch {batch_num + 1}")
+
+        # Re-audit after retry
+        still_missing = self.audit_week_downloads(week_str)
+        return still_missing
+
+    # =========================================================================
+    # MAIN RUN
+    # =========================================================================
+
+    def run(self, weeks_to_download: int = 1):
+        """Main execution — downloads all stores with audit and retry"""
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Starting Jimmy John's WSR Export Bot")
+        logger.info(f"{'='*60}\n")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            context = browser.new_context(
+                accept_downloads=True,
+                viewport={'width': 1920, 'height': 1080}
+            )
+            page = context.new_page()
+            page.on("console", lambda msg: logger.debug(f"Browser: {msg.text}"))
+
+            if not self.login(page):
+                raise Exception("Login failed")
+
+            if not self.navigate_to_wsr_export(page):
+                raise Exception("Failed to navigate to WSR Export")
+
+            # Track overall audit results
+            audit_summary = {}
+
+            for week_offset in range(weeks_to_download):
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Processing Week {week_offset + 1} of {weeks_to_download}")
+                logger.info(f"{'='*50}")
+
+                selected_week = self.select_reporting_week(page, week_offset)
+                if not selected_week:
+                    logger.error(f"Failed to select week {week_offset}")
+                    continue
+
+                # Derive the week_str used in ZIP filenames (e.g. "03-03-2026")
+                week_str = selected_week.strip().replace('/', '-') if selected_week else "unknown"
+
+                total_stores = self.get_all_stores(page)
+                if total_stores == 0:
+                    logger.error("No stores found")
+                    continue
+
+                batch_size = 5
+                num_batches = (total_stores + batch_size - 1) // batch_size
+                logger.info(f"Total stores: {total_stores} | Batches: {num_batches}")
+
+                # ── Initial download pass ──────────────────────────────────
+                BATCH_MAX_ATTEMPTS = 3
+
+                for batch_num in range(num_batches):
+                    batch_start = batch_num * batch_size
+                    logger.info(f"\n--- Batch {batch_num + 1} of {num_batches} ---")
+
+                    batch_success = False
+
+                    for attempt in range(1, BATCH_MAX_ATTEMPTS + 1):
+                        if attempt > 1:
+                            logger.warning(f"  Batch {batch_num + 1} attempt {attempt}/{BATCH_MAX_ATTEMPTS}...")
+
+                        # Reload and re-select week before every attempt
+                        # (always reload so state is clean, skip only on very first attempt of first batch)
+                        if batch_num > 0 or attempt > 1:
+                            page.reload()
+                            page.wait_for_load_state('networkidle', timeout=30000)
+                            page.wait_for_timeout(2000)
+                            self.select_reporting_week(page, week_offset)
+                            page.wait_for_timeout(10000)
+
+                        num_selected = self.select_store_batch(page, batch_start, batch_size, total_stores)
+
+                        if num_selected == 0:
+                            logger.warning(f"  No stores selected on attempt {attempt}")
+                            continue
+
+                        filepath = self.download_wsr_export(page, selected_week, batch_num + 1)
+
+                        if filepath:
+                            batch_success = True
+                            break
+                        else:
+                            logger.warning(f"  Download failed on attempt {attempt}")
+
+                    if not batch_success:
+                        raise Exception(
+                            f"Batch {batch_num + 1} failed after {BATCH_MAX_ATTEMPTS} attempts "
+                            f"(stores {batch_start + 1}–{min(batch_start + batch_size, total_stores)}). "
+                            f"Aborting run."
+                        )
+
+                    if batch_num < num_batches - 1:
+                        time.sleep(10)
+
+                # ── Audit ─────────────────────────────────────────────────
+                missing = self.audit_week_downloads(week_str)
+
+                # ── Retry loop ────────────────────────────────────────────
+                attempt = 0
+                while missing and attempt < MAX_RETRY_ATTEMPTS:
+                    attempt += 1
+                    logger.info(f"\n{'='*50}")
+                    logger.info(f"RETRY ATTEMPT {attempt}/{MAX_RETRY_ATTEMPTS} for week {week_str}")
+                    logger.info(f"{'='*50}")
+
+                    missing = self.retry_missing_stores(
+                        page, week_offset, selected_week, missing, week_str
                     )
-                    batch = resp.data or []
-                    all_store_numbers.extend(r['store_number'] for r in batch)
-                    if total_rows == 0:
-                        total_rows = resp.count or 0
-                    if len(batch) < page_size:
-                        break
-                    offset += page_size
 
-                unique_stores = len(set(all_store_numbers))
-                avg = total_rows / unique_stores if unique_stores else 0
-                wsr_ok = unique_stores >= len(EXPECTED_STORES) and avg >= 20
-
-                status = "✓" if wsr_ok else "⚠️"
-                logger.info(
-                    f"  {status} services_wsr      : {total_rows:,} rows, "
-                    f"{unique_stores} stores, avg {avg:.1f} rows/store"
-                )
-                if not wsr_ok:
-                    all_passed = False
-                    if unique_stores < len(EXPECTED_STORES):
-                        logger.warning(f"    Only {unique_stores}/{len(EXPECTED_STORES)} stores in DB")
-                    if avg < 20:
-                        logger.warning(f"    Low avg rows/store ({avg:.1f}) — possible parse issue")
-
-            except Exception as e:
-                logger.error(f"  ✗ services_wsr query failed: {e}")
-                all_passed = False
-
-            # ── weekly_sales_expected ─────────────────────────────────────
-            try:
-                # week_ending in this table may be in YYYY-MM-DD format
-                # Try both the raw value and ISO-converted value
-                iso_week = week
-                if '/' in week:
-                    parts = week.split('/')
-                    if len(parts) == 3:
-                        iso_week = f"{parts[2]}-{int(parts[0]):02d}-{int(parts[1]):02d}"
-
-                resp2 = (
-                    self.supabase.table(self.expected_deposits_table)
-                    .select('store_number,date', count='exact')
-                    .eq('week_ending', iso_week)
-                    .execute()
-                )
-                total_exp = resp2.count or len(resp2.data)
-                exp_stores = len(set(str(r['store_number']) for r in resp2.data))
-                exp_days = len(set(r['date'] for r in resp2.data))
-
-                exp_ok = exp_stores >= len(EXPECTED_STORES) and total_exp >= len(EXPECTED_STORES) * 7
-                status = "✓" if exp_ok else "⚠️"
-                logger.info(
-                    f"  {status} weekly_sales_expected: {total_exp:,} rows, "
-                    f"{exp_stores} stores, {exp_days} distinct days"
-                )
-                if not exp_ok:
-                    all_passed = False
-                    if exp_stores < len(EXPECTED_STORES):
-                        logger.warning(f"    Only {exp_stores}/{len(EXPECTED_STORES)} stores in expected deposits")
-                    if exp_days < 7:
-                        logger.warning(f"    Only {exp_days}/7 days covered")
-
-            except Exception as e:
-                logger.error(f"  ✗ weekly_sales_expected query failed: {e}")
-                all_passed = False
-
-        logger.info(f"\n{'─'*60}")
-        if all_passed:
-            logger.info("  ✓ All Supabase verification checks passed")
-        else:
-            logger.error("  ❌ One or more Supabase verification checks FAILED")
-
-        return all_passed
-
-    # ========================================================================
-    # STORE & ACCOUNT MAPPING
-    # ========================================================================
-
-    def load_account_mapping(self) -> Dict:
-        if not self.sheets_service or not self.spreadsheet_id:
-            logger.warning("Google Sheets not configured, using WSR names as-is")
-            return {}
-
-        try:
-            logger.info("Loading account mapping from 'Key' tab...")
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Key!A:D'
-            ).execute()
-
-            values = result.get('values', [])
-            if not values:
-                logger.warning("Key tab is empty")
-                return {}
-
-            mapping = {}
-            logger.info("Reading Key tab rows (showing first 10):")
-
-            for idx, row in enumerate(values[1:], start=2):
-                if len(row) >= 2:
-                    wsr_name = row[0].strip() if row[0] else ''
-                    qbo_name = row[1].strip() if len(row) > 1 and row[1] else ''
-
-                    if idx <= 11:
-                        logger.info(f"  Row {idx}: {row}")
-
-                    name = ''
-                    if len(row) > 2 and row[2]:
-                        val = row[2].strip()
-                        if val.lower() not in ['debit', 'credit', 'reverse']:
-                            name = val
-
-                    debit_credit = 'Debit'
-                    if len(row) > 3 and row[3]:
-                        debit_credit = row[3].strip()
-                    elif len(row) > 2 and row[2]:
-                        val = row[2].strip()
-                        if val.lower() in ['debit', 'credit', 'reverse']:
-                            debit_credit = val
-
-                    if wsr_name and qbo_name:
-                        mapping[wsr_name] = {
-                            'qbo_account': qbo_name,
-                            'debit_credit': debit_credit,
-                            'name': name
-                        }
-                        if len(mapping) <= 5:
-                            logger.info(f"  ✓ {wsr_name} -> {qbo_name} ({debit_credit})")
-
-            logger.info(f"✓ Loaded {len(mapping)} account mappings from Key tab")
-            return mapping
-
-        except Exception as e:
-            logger.warning(f"Could not load Key tab: {e}")
-            return {}
-
-    def load_store_mapping(self) -> Dict:
-        mapping = {
-            2682: {"legal_entity": "Atlas East", "class_code": "2682 - North Fayatte", "store_name": "North Fayette"},
-            2683: {"legal_entity": "Atlas East", "class_code": "2683 - Bridgeville", "store_name": "Bridgeville"},
-            2749: {"legal_entity": "Atlas East", "class_code": "2749 - Cannonsburg", "store_name": "Southpointe"},
-            3686: {"legal_entity": "Atlas East", "class_code": "3686 - Homestead", "store_name": "Homestead"},
-            4586: {"legal_entity": "Atlas East", "class_code": "4586 - Pittsburgh Airport", "store_name": "Pittsburgh Airport"},
-            746:  {"legal_entity": "Atlas NGC",  "class_code": "0746 - Burnsville", "store_name": "Burnsville"},
-            833:  {"legal_entity": "Atlas NGC",  "class_code": "0833 - Shakopee", "store_name": "Shakopee"},
-            1061: {"legal_entity": "Atlas NGC",  "class_code": "1061 - Wayzata", "store_name": "Wayzata"},
-            1206: {"legal_entity": "Atlas NGC",  "class_code": "1206 - Savage", "store_name": "Savage"},
-            1337: {"legal_entity": "Atlas NGC",  "class_code": "1337 - Carriage", "store_name": "Shakopee II"},
-            522:  {"legal_entity": "Atlas 0519", "class_code": "0522 - Warren", "store_name": "Mankato"},
-            1342: {"legal_entity": "Atlas 0519", "class_code": "1342 - Western", "store_name": "Fairbault"},
-            2021: {"legal_entity": "Atlas 0519", "class_code": "2021 - Holly", "store_name": "Holly"},
-            2807: {"legal_entity": "Atlas NGC",  "class_code": "2807 - MacArthur", "store_name": "MacArthur"},
-            2808: {"legal_entity": "Atlas NGC",  "class_code": "2808 - Marguerite", "store_name": "Mission Viejo"},
-            2811: {"legal_entity": "Atlas West", "class_code": "2811 - Edinger", "store_name": "Edinger"},
-            2812: {"legal_entity": "Atlas West", "class_code": "2812 - Newhope", "store_name": "New Hope"},
-            3260: {"legal_entity": "Atlas West", "class_code": "3260 - Irvine", "store_name": "Irvine"},
-            2821: {"legal_entity": "Atlas West", "class_code": "2821 - Lake Forest", "store_name": "Lake Forest"},
-            2873: {"legal_entity": "Atlas West", "class_code": "2873 - La Verne", "store_name": "La Verne"},
-            2874: {"legal_entity": "Atlas West", "class_code": "2874 - Upland", "store_name": "Upland"},
-            3391: {"legal_entity": "Atlas West", "class_code": "3391 - 4th & Haven", "store_name": "4th & Haven"},
-            2876: {"legal_entity": "Atlas West", "class_code": "2876 - Irwindale", "store_name": "Irwindale"},
-            4018: {"legal_entity": "Atlas West", "class_code": "4018 - Beverly Hills", "store_name": "Beverly"},
-            4022: {"legal_entity": "Atlas West", "class_code": "4022 - Raymond", "store_name": "Raymond"},
-            4024: {"legal_entity": "Atlas West", "class_code": "4024 - Figueroa", "store_name": "Fig"},
-            1694: {"legal_entity": "Atlas 0519", "class_code": "1694 - Hayden", "store_name": "Hayden"},
-            1695: {"legal_entity": "Atlas 0519", "class_code": "1695 - Cactus", "store_name": "Cactus"},
-            2503: {"legal_entity": "Atlas 0519", "class_code": "2503 - Scottsdale", "store_name": "Scottsdale"},
-            2504: {"legal_entity": "Atlas 0519", "class_code": "2504 - 90th", "store_name": "90th"},
-            2006: {"legal_entity": "Atlas NGC",  "class_code": "2006 - McDowell", "store_name": "Goodyear"},
-            2391: {"legal_entity": "Atlas NGC",  "class_code": "2391 - Camelback", "store_name": "W Camelback"},
-            2883: {"legal_entity": "Atlas NGC",  "class_code": "2883 - Payson", "store_name": "Payson"},
-            1762: {"legal_entity": "Atlas NGC",  "class_code": "1762 - Avondale", "store_name": "Avondale"},
-            2884: {"legal_entity": "Atlas NGC",  "class_code": "2884 - Estrella", "store_name": "Estrella"},
-            3635: {"legal_entity": "Atlas NGC",  "class_code": "3635 - Buckeye", "store_name": "Buckeye"},
-            1556: {"legal_entity": "Atlas 0519", "class_code": "1556 - Camelback", "store_name": "E Camelback"},
-            1635: {"legal_entity": "Atlas 0519", "class_code": "1635 - Washington", "store_name": "Washington"},
-            2180: {"legal_entity": "Atlas 0519", "class_code": "2180 - N 16th", "store_name": "16th"},
-            2500: {"legal_entity": "Atlas 0519", "class_code": "2500 - Roosevelt", "store_name": "Roosevelt"},
-            2502: {"legal_entity": "Atlas 0519", "class_code": "2502 - Central Ave", "store_name": "Central"},
-            1696: {"legal_entity": "Atlas 0519", "class_code": "1696 - Agua Fria", "store_name": "Agua Fria"},
-            1955: {"legal_entity": "Atlas 0519", "class_code": "1955 - East Bell", "store_name": "Bell 1"},
-            1956: {"legal_entity": "Atlas 0519", "class_code": "1956 - Thunderbird", "store_name": "Thunderbird"},
-            2176: {"legal_entity": "Atlas 0519", "class_code": "2176 - Tatum", "store_name": "Tatum"},
-            3972: {"legal_entity": "Atlas 0519", "class_code": "3972 - Deer Valley", "store_name": "Deer Valley"},
-            1554: {"legal_entity": "Atlas 0519", "class_code": "1554 - Scottsdale", "store_name": "N Scottsdale"},
-            1957: {"legal_entity": "Atlas 0519", "class_code": "1957 - 44th", "store_name": "44th"},
-            2178: {"legal_entity": "Atlas 0519", "class_code": "2178 - EastBell", "store_name": "Bell 2"},
-            2501: {"legal_entity": "Atlas 0519", "class_code": "2501 - North Cave", "store_name": "Cave Creek"},
-            1127: {"legal_entity": "Atlas East", "class_code": "1127 - St Pete", "store_name": "St Pete"},
-            1441: {"legal_entity": "Atlas East", "class_code": "1441 - Carrollwood", "store_name": "Carrollwood"},
-            3030: {"legal_entity": "Atlas East", "class_code": "3030 - Waters", "store_name": "Waters"},
-            3187: {"legal_entity": "Atlas East", "class_code": "3187 - Bay Pines", "store_name": "Bay Pines"},
-            3613: {"legal_entity": "Atlas East", "class_code": "3613 - Odessa", "store_name": "Odessa"},
-            1307: {"legal_entity": "Atlas East", "class_code": "1307 - Howard", "store_name": "Howard"},
-            1440: {"legal_entity": "Atlas East", "class_code": "1440 - Stadium", "store_name": "Stadium"},
-            1562: {"legal_entity": "Atlas East", "class_code": "1562 - West Shore", "store_name": "West Shore"},
-            3029: {"legal_entity": "Atlas East", "class_code": "3029 - South Tampa", "store_name": "South Tampa"},
-            1789: {"legal_entity": "Atlas East", "class_code": "1789 - Brandon", "store_name": "Brandon"},
-            3612: {"legal_entity": "Atlas East", "class_code": "3612 - Causeway", "store_name": "Causeway"},
-            4105: {"legal_entity": "Atlas East", "class_code": "4105 - Wesley Chapel", "store_name": "Wesley Chapel"},
-            838:  {"legal_entity": "Atlas East", "class_code": "0838 - W Broadway", "store_name": "W Broadway"},
-            1111: {"legal_entity": "Atlas East", "class_code": "1111 - E Broadway", "store_name": "E Broadway"},
-            2712: {"legal_entity": "Atlas East", "class_code": "2712 - Lake Manawa", "store_name": "Manawa"},
-            1261: {"legal_entity": "Atlas East", "class_code": "1261 - S 13th", "store_name": "S 13th"},
-            799:  {"legal_entity": "Atlas East", "class_code": "0799 - Farnam", "store_name": "Farnam"},
-            877:  {"legal_entity": "Atlas East", "class_code": "0877 - Harlan", "store_name": "Harlan"},
-            1018: {"legal_entity": "Atlas East", "class_code": "1018 - Twin Creek", "store_name": "Twin Creek"},
-            1019: {"legal_entity": "Atlas East", "class_code": "1019 - Giles", "store_name": "Giles"},
-            1779: {"legal_entity": "Atlas East", "class_code": "1779 - Shadow Lake", "store_name": "Midlands"},
-            2601: {"legal_entity": "Atlas East", "class_code": "2601 - L Street", "store_name": "L Street"},
-            2711: {"legal_entity": "Atlas East", "class_code": "2711 - Gretna", "store_name": "Gretna"},
-            965:  {"legal_entity": "Atlas East", "class_code": "0965 - Sorenson", "store_name": "Sorenson"},
-            1002: {"legal_entity": "Atlas East", "class_code": "1002 - Irvington", "store_name": "Irvington"},
-            1355: {"legal_entity": "Atlas East", "class_code": "1355 - N 30th", "store_name": "N 30th"},
-            4330: {"legal_entity": "Atlas East", "class_code": "4330 - Blair", "store_name": "Blair"},
-            930:  {"legal_entity": "Atlas East", "class_code": "0930 - Elkhorn", "store_name": "Elkhorn"},
-            4358: {"legal_entity": "Atlas East", "class_code": "4358 - Indian Creek", "store_name": "Elkhorn"},
-        }
-        logger.info(f"Loaded mapping for {len(mapping)} stores")
-        return mapping
-
-    # ========================================================================
-    # ZIP EXTRACTION
-    # ========================================================================
-
-    def extract_zip_files(self, directory: str) -> List[str]:
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Extracting ZIP files from: {directory}")
-
-        extracted_files = []
-        zip_files = [f for f in os.listdir(directory) if f.endswith('.zip')]
-
-        if not zip_files:
-            logger.info("No ZIP files found")
-            return extracted_files
-
-        logger.info(f"Found {len(zip_files)} ZIP file(s)")
-
-        for zip_filename in zip_files:
-            zip_path = os.path.join(directory, zip_filename)
-            logger.info(f"\n-> Extracting: {zip_filename}")
-
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    file_list = zip_ref.namelist()
-                    xls_files = [f for f in file_list if f.endswith('.xls') or f.endswith('.xlsx')]
-                    logger.info(f"  Contains {len(xls_files)} Excel file(s)")
-                    zip_ref.extractall(directory)
-                    for xls_file in xls_files:
-                        extracted_path = os.path.join(directory, xls_file)
-                        if os.path.exists(extracted_path):
-                            extracted_files.append(extracted_path)
-                            logger.info(f"  ✓ Extracted: {xls_file}")
-                logger.info(f"✓ Successfully extracted {zip_filename}")
-            except Exception as e:
-                logger.error(f"✗ Failed to extract {zip_filename}: {e}")
-
-        logger.info(f"\n✓ Total Excel files extracted: {len(extracted_files)}")
-        return extracted_files
-
-    # ========================================================================
-    # PART 1: WSR LINE-ITEM PARSING
-    # ========================================================================
-
-    def parse_wsr_file(self, filepath: str, attempt: int = 1) -> List[Dict]:
-        """Parse a single WSR file with retry wrapper"""
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Parsing WSR file (attempt {attempt}): {os.path.basename(filepath)}")
-
-        try:
-            df = pd.read_excel(filepath, sheet_name='Weekly Sales')
-
-            week_ending = None
-            store_number = None
-
-            if df.shape[0] > 0:
-                week_text = str(df.iloc[0, 2])
-                if pd.notna(week_text) and week_text != 'nan':
-                    try:
-                        week_ending = pd.to_datetime(week_text).strftime('%m/%d/%Y')
-                    except:
-                        logger.warning(f"Could not parse week ending date: {week_text}")
-
-            if df.shape[0] > 2:
-                store_text = str(df.iloc[2, 2])
-                if pd.notna(store_text) and store_text != 'nan':
-                    try:
-                        store_number = int(float(store_text))
-                    except:
-                        logger.warning(f"Could not parse store number: {store_text}")
-
-            if not week_ending or not store_number:
-                logger.error(f"Missing metadata: week_ending={week_ending}, store_number={store_number}")
-                return []
-
-            logger.info(f"Week Ending: {week_ending} | Store: {store_number}")
-
-            store_info = self.store_mapping.get(store_number)
-            if not store_info:
-                logger.warning(f"Store {store_number} not in mapping")
-                legal_entity = "Unknown"
-                class_code = f"{store_number} - Unknown"
-                store_name = f"Store {store_number}"
-            else:
-                legal_entity = store_info['legal_entity']
-                class_code = store_info['class_code']
-                store_name = store_info['store_name']
-
-            header_row = None
-            for idx in range(min(10, len(df))):
-                row_vals = df.iloc[idx].astype(str).tolist()
-                if 'Sales Item' in row_vals and 'Summary' in row_vals:
-                    header_row = idx
-                    break
-
-            if header_row is None:
-                logger.error("Could not find header row")
-                return []
-
-            records = []
-            for idx in range(header_row + 3, len(df)):
-                row = df.iloc[idx]
-                sales_item = row.iloc[0]
-                summary = row.iloc[1]
-
-                if pd.isna(sales_item) or str(sales_item).strip() == '' or str(sales_item) == 'nan':
-                    continue
-
-                sales_item_str = str(sales_item).strip()
-                if sales_item_str in ['Total of Above', '- OVER-RINGS', '= Adjusted Sales']:
-                    continue
-
-                try:
-                    amount = float(summary) if pd.notna(summary) else 0.0
-                except:
-                    amount = 0.0
-
-                # Guard against numeric overflow (Supabase field is precision 10, scale 2)
-                if abs(amount) >= 100_000_000:
-                    logger.warning(
-                        f"Overflow value {amount} skipped for '{sales_item_str}' "
-                        f"store {store_number} — setting to 0.0"
+                if missing:
+                    logger.error(
+                        f"❌ Week {week_str}: {len(missing)} stores still missing after "
+                        f"{MAX_RETRY_ATTEMPTS} retries: {sorted(missing)}"
                     )
-                    amount = 0.0
+                    audit_summary[week_str] = {"status": "INCOMPLETE", "missing": sorted(missing)}
+                else:
+                    logger.info(f"✓ Week {week_str}: All stores downloaded successfully")
+                    audit_summary[week_str] = {"status": "COMPLETE", "missing": []}
 
-                records.append({
-                    'store_number': store_number,
-                    'store_name': store_name,
-                    'legal_entity': legal_entity,
-                    'class_code': class_code,
-                    'week_ending': week_ending,
-                    'sales_item': sales_item_str,
-                    'amount': amount,
-                    'description': f"{week_ending} WSR Entry",
-                    'created_at': datetime.now().isoformat()
-                })
+            time.sleep(5)
+            browser.close()
 
-            logger.info(f"Extracted {len(records)} account records")
-            return records
-
-        except Exception as e:
-            logger.error(f"Failed to parse file (attempt {attempt}): {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    def parse_wsr_file_with_retry(self, filepath: str) -> List[Dict]:
-        """Parse with up to MAX_PARSE_RETRIES attempts"""
-        for attempt in range(1, MAX_PARSE_RETRIES + 1):
-            records = self.parse_wsr_file(filepath, attempt)
-            if records:
-                return records
-            if attempt < MAX_PARSE_RETRIES:
-                logger.warning(f"Parse attempt {attempt} returned 0 records, retrying...")
-                import time
-                time.sleep(2)
-        logger.error(f"All {MAX_PARSE_RETRIES} parse attempts failed for {os.path.basename(filepath)}")
-        return []
-
-    def upload_to_supabase(self, records: List[Dict]):
-        """Upload WSR records to Supabase services_wsr table via upsert"""
-        if not self.supabase:
-            logger.warning("Supabase not configured, skipping upload")
-            return
-
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Uploading {len(records)} WSR records to Supabase (upsert)")
-
-        try:
-            total_uploaded = 0
-            for i in range(0, len(records), self.batch_size):
-                batch = records[i:i + self.batch_size]
-                self.supabase.table('services_wsr').upsert(
-                    batch,
-                    on_conflict='store_number,week_ending,sales_item'
-                ).execute()
-                total_uploaded += len(batch)
-                logger.info(f"Upserted batch: {total_uploaded}/{len(records)} records")
-
-            logger.info(f"✓ Successfully upserted {total_uploaded} records")
-
-        except Exception as e:
-            logger.error(f"Failed to upload to Supabase: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # ========================================================================
-    # GOOGLE SHEETS TAB CREATION  (unchanged from original)
-    # ========================================================================
-
-    def create_google_sheets_tabs(self, records: List[Dict], week_ending: str = None):
-        if not self.sheets_service:
-            logger.warning("Google Sheets not configured, skipping tab creation")
-            return
-
-        logger.info(f"\n{'='*80}")
-        logger.info("Creating Google Sheets tabs")
-
-        try:
-            by_entity_week = {}
-            for record in records:
-                key = f"{record['legal_entity']}|{record['week_ending']}"
-                if key not in by_entity_week:
-                    by_entity_week[key] = []
-                by_entity_week[key].append(record)
-
-            for key, entity_records in by_entity_week.items():
-                entity, week = key.split('|')
-                self.create_sheet_tab(f"{entity} {week}", entity_records)
-
-            logger.info(f"✓ Created {len(by_entity_week)} tabs")
-
-        except Exception as e:
-            logger.error(f"Failed to create Google Sheets tabs: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def create_sheet_tab(self, tab_name: str, records: List[Dict]):
-        try:
-            spreadsheet = self.sheets_service.spreadsheets().get(
-                spreadsheetId=self.spreadsheet_id
-            ).execute()
-
-            sheet_id = None
-            for sheet in spreadsheet.get('sheets', []):
-                if sheet['properties']['title'] == tab_name:
-                    sheet_id = sheet['properties']['sheetId']
-                    break
-
-            if sheet_id is None:
-                response = self.sheets_service.spreadsheets().batchUpdate(
-                    spreadsheetId=self.spreadsheet_id,
-                    body={'requests': [{'addSheet': {'properties': {'title': tab_name, 'index': 0}}}]}
-                ).execute()
-                sheet_id = response['replies'][0]['addSheet']['properties']['sheetId']
+        # ── Final summary ─────────────────────────────────────────────────
+        logger.info(f"\n{'='*60}")
+        logger.info("BOT EXECUTION COMPLETE — AUDIT SUMMARY")
+        logger.info(f"{'='*60}")
+        for week, result in audit_summary.items():
+            status = result["status"]
+            missing = result["missing"]
+            if missing:
+                logger.error(f"  {week}: {status} — missing {len(missing)} stores: {missing}")
             else:
-                self.sheets_service.spreadsheets().batchUpdate(
-                    spreadsheetId=self.spreadsheet_id,
-                    body={'requests': [{'updateCells': {'range': {'sheetId': sheet_id}, 'fields': 'userEnteredValue'}}]}
-                ).execute()
+                logger.info(f"  {week}: {status} ✓")
+        logger.info(f"Total files downloaded: {len(self.downloaded_files)}")
 
-            header_row = [['Account', 'Amount', 'Journal Date', 'Description', 'Name', 'Class']]
-            data_rows = []
-            skipped_count = 0
+        # Exit with error code if any week is incomplete (fails the GitHub Action)
+        if any(r["status"] == "INCOMPLETE" for r in audit_summary.values()):
+            raise Exception("Download audit failed — one or more weeks are incomplete. Check logs.")
 
-            for record in records:
-                sales_item = record['sales_item']
-                amount = record['amount']
-                mapping_info = self.account_mapping.get(sales_item)
-
-                if not mapping_info:
-                    stripped = sales_item.lstrip('- ').lstrip('+ ').lstrip('= ')
-                    mapping_info = self.account_mapping.get(stripped)
-
-                if not mapping_info:
-                    skipped_count += 1
-                    continue
-
-                qbo_account = mapping_info['qbo_account']
-                debit_credit = mapping_info['debit_credit']
-                name = mapping_info.get('name', '')
-
-                adjusted_amount = amount
-                if debit_credit.lower() == 'reverse':
-                    adjusted_amount = -amount
-                elif debit_credit.lower() == 'debit' and amount > 0:
-                    adjusted_amount = -amount
-                elif debit_credit.lower() == 'credit' and amount < 0:
-                    adjusted_amount = -amount
-
-                data_rows.append([
-                    qbo_account, adjusted_amount, record['week_ending'],
-                    record['description'], name, record['class_code']
-                ])
-
-            if skipped_count > 0:
-                logger.info(f"  Skipped {skipped_count} unmapped accounts")
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"{tab_name}!A1",
-                valueInputOption='RAW',
-                body={'values': header_row + data_rows}
-            ).execute()
-
-            self.sheets_service.spreadsheets().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={'requests': [{'repeatCell': {
-                    'range': {'sheetId': sheet_id, 'startRowIndex': 0, 'endRowIndex': 1},
-                    'cell': {'userEnteredFormat': {
-                        'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.2},
-                        'textFormat': {'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}, 'bold': True}
-                    }},
-                    'fields': 'userEnteredFormat(backgroundColor,textFormat)'
-                }}]}
-            ).execute()
-
-            logger.info(f"✓ Wrote {len(data_rows)} rows to tab '{tab_name}'")
-
-        except Exception as e:
-            logger.error(f"Failed to create/update tab '{tab_name}': {e}")
-            import traceback
-            traceback.print_exc()
-
-    # ========================================================================
-    # PART 2: WEEKLY SALES EXPECTED DEPOSITS
-    # ========================================================================
-
-    def parse_weekly_sales_xlsx(self, path: str) -> List[Dict[str, Any]]:
-        logger.info(f"Parsing Weekly Sales (xlsx): {os.path.basename(path)}")
-        wb = openpyxl.load_workbook(path, data_only=True)
-        if "Weekly Sales" not in wb.sheetnames:
-            logger.warning(f'"Weekly Sales" not found in {path}')
-            return []
-
-        ws = wb["Weekly Sales"]
-        store_number = str(ws.cell(4, 3).value).strip()
-        week_ending = _to_iso_date(ws.cell(2, 3).value)
-        EXPECTED_ROW = 60
-
-        out = []
-        for c in range(4, 18, 2):
-            date = _to_iso_date(ws.cell(9, c).value)
-            if not date:
-                continue
-            am = _to_float(ws.cell(EXPECTED_ROW, c).value)
-            pm = _to_float(ws.cell(EXPECTED_ROW, c + 1).value)
-            total = None if (am is None or pm is None) else am + pm
-            out.append({
-                "store_number": store_number,
-                "week_ending": week_ending,
-                "date": date,
-                "am_expected": am,
-                "pm_expected": pm,
-                "expected_deposit": total,
-                "source_file": os.path.basename(path),
-            })
-
-        if len(out) != 7:
-            logger.warning(f"Expected 7 days, got {len(out)}")
-        return out
-
-    def parse_weekly_sales_xls(self, path: str) -> List[Dict[str, Any]]:
-        logger.info(f"Parsing Weekly Sales (xls): {os.path.basename(path)}")
-        df = pd.read_excel(path, sheet_name="Weekly Sales", header=None, engine="xlrd")
-
-        store_number = str(df.iat[3, 2]).strip()
-        week_ending = _to_iso_date(df.iat[1, 2])
-        EXPECTED_ROW = 59
-
-        out = []
-        for col_excel_1based in range(4, 18, 2):
-            c0 = col_excel_1based - 1
-            date = _to_iso_date(df.iat[8, c0])
-            if not date:
-                continue
-            am = _to_float(df.iat[EXPECTED_ROW, c0])
-            pm = _to_float(df.iat[EXPECTED_ROW, c0 + 1])
-            total = None if (am is None or pm is None) else am + pm
-            out.append({
-                "store_number": store_number,
-                "week_ending": week_ending,
-                "date": date,
-                "am_expected": am,
-                "pm_expected": pm,
-                "expected_deposit": total,
-                "source_file": os.path.basename(path),
-            })
-
-        if len(out) != 7:
-            logger.warning(f"Expected 7 days, got {len(out)}")
-        return out
-
-    def parse_weekly_sales_file(self, path: str) -> List[Dict[str, Any]]:
-        lower = path.lower()
-        try:
-            if lower.endswith(".xlsx"):
-                return self.parse_weekly_sales_xlsx(path)
-            elif lower.endswith(".xls"):
-                return self.parse_weekly_sales_xls(path)
-            else:
-                logger.warning(f"Unsupported file type: {path}")
-                return []
-        except Exception as e:
-            logger.error(f"Failed to parse Weekly Sales from {path}: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    def upload_expected_deposits_to_supabase(self, records: List[Dict[str, Any]]):
-        if not self.supabase or not records:
-            return
-
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Uploading {len(records)} expected deposits records (upsert)")
-
-        try:
-            for i in range(0, len(records), self.batch_size):
-                batch = records[i:i + self.batch_size]
-                self.supabase.table(self.expected_deposits_table).upsert(
-                    batch,
-                    on_conflict='store_number,date'
-                ).execute()
-                logger.info(f"  Upserted batch {i // self.batch_size + 1}")
-
-            logger.info(f"✓ All {len(records)} expected deposits records uploaded")
-
-        except Exception as e:
-            logger.error(f"Failed to upload expected deposits: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def process_weekly_sales_files(self, directory: str) -> List[Dict[str, Any]]:
-        if not os.path.exists(directory):
-            logger.error(f"Directory not found: {directory}")
-            return []
-
-        all_files = [f for f in os.listdir(directory)
-                     if (f.endswith('.xls') or f.endswith('.xlsx'))
-                     and not f.startswith('~$')]
-
-        all_records = []
-        for filename in all_files:
-            records = self.parse_weekly_sales_file(os.path.join(directory, filename))
-            if records:
-                all_records.extend(records)
-
-        return all_records
-
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
 
 def main():
-    auto_confirm = '--auto-confirm' in sys.argv
-    parser = WSRParser()
-    download_dir = os.getenv('PROCESSED_DIR', './processed')
-
-    if not os.path.exists(download_dir):
-        logger.error(f"Directory not found: {download_dir}")
-        sys.exit(1)
-
-    overall_success = True
-    unique_weeks = []
-
-    # ========================================================================
-    # PART 1: WSR LINE-ITEM DATA
-    # ========================================================================
-    logger.info(f"\n{'='*80}")
-    logger.info("PART 1: WSR PROCESSING")
-    logger.info(f"{'='*80}")
-
-    parser.extract_zip_files(download_dir)
-
-    wsr_files = [f for f in os.listdir(download_dir)
-                 if (f.endswith('.xls') or f.endswith('.xlsx'))
-                 and not f.startswith('~$')]
-
-    if wsr_files:
-        logger.info(f"Found {len(wsr_files)} Excel file(s)")
-
-        proceed = auto_confirm
-        if not proceed:
-            print(f"\nProcess {len(wsr_files)} file(s) for WSR data? (y/n): ", end='')
-            proceed = input().lower() == 'y'
-
-        if proceed:
-            # ── Parse all files ───────────────────────────────────────────
-            all_wsr_records = []
-            failed_files = []
-
-            for wsr_file in wsr_files:
-                filepath = os.path.join(download_dir, wsr_file)
-                records = parser.parse_wsr_file_with_retry(filepath)
-                if records:
-                    all_wsr_records.extend(records)
-                else:
-                    failed_files.append(wsr_file)
-
-            if failed_files:
-                logger.warning(f"\n⚠️  {len(failed_files)} file(s) produced zero records after retries:")
-                for f in failed_files:
-                    logger.warning(f"    {f}")
-
-            # ── Audit parsed records ──────────────────────────────────────
-            if all_wsr_records:
-                unique_weeks = sorted(set(r['week_ending'] for r in all_wsr_records))
-                logger.info(f"\nTotal WSR records: {len(all_wsr_records)}")
-                logger.info(f"Weeks found: {', '.join(unique_weeks)}")
-
-                # Audit per week
-                for week in unique_weeks:
-                    week_records = [r for r in all_wsr_records if r['week_ending'] == week]
-                    missing = parser.audit_parsed_records(week_records, label=f"WSR week {week}")
-                    if missing:
-                        overall_success = False
-
-                # ── Upload ────────────────────────────────────────────────
-                parser.upload_to_supabase(all_wsr_records)
-
-                # ── Google Sheets ─────────────────────────────────────────
-                parser.create_google_sheets_tabs(all_wsr_records)
-
-            else:
-                logger.warning("No WSR records extracted")
-                overall_success = False
-
-    # ========================================================================
-    # PART 2: EXPECTED DEPOSITS
-    # ========================================================================
-    logger.info(f"\n{'='*80}")
-    logger.info("PART 2: WEEKLY SALES EXPECTED DEPOSITS")
-    logger.info(f"{'='*80}")
-
-    expected_deposits = parser.process_weekly_sales_files(download_dir)
-
-    if expected_deposits:
-        # Audit
-        exp_issues = parser.audit_expected_deposits(expected_deposits)
-        if exp_issues["missing_stores"] or exp_issues["incomplete_days"]:
-            overall_success = False
-
-        proceed = auto_confirm
-        if not proceed:
-            print(f"\nUpload {len(expected_deposits)} expected deposits? (y/n): ", end='')
-            proceed = input().lower() == 'y'
-
-        if proceed:
-            parser.upload_expected_deposits_to_supabase(expected_deposits)
-
-        # CSV export
-        csv_path = os.path.join(download_dir, 'weekly_expected_deposits.csv')
-        pd.DataFrame(expected_deposits).sort_values(['store_number', 'date']).to_csv(csv_path, index=False)
-        logger.info(f"✓ Exported CSV: {csv_path}")
-
-    else:
-        logger.warning("No expected deposits data extracted")
-        overall_success = False
-
-    # ========================================================================
-    # SUPABASE VERIFICATION — runs after both parts complete
-    # ========================================================================
-    if unique_weeks:
-        verified = parser.verify_supabase_upload(unique_weeks)
-        if not verified:
-            overall_success = False
-
-    # ========================================================================
-    # FINAL SUMMARY
-    # ========================================================================
-    logger.info(f"\n{'='*80}")
-    if overall_success:
-        logger.info("✓ ALL PROCESSING COMPLETE — no issues detected")
-    else:
-        logger.error("❌ PROCESSING COMPLETE WITH ISSUES — review warnings above")
-    logger.info(f"{'='*80}")
-
-    # Non-zero exit code fails the GitHub Action and triggers notification
-    if not overall_success:
-        sys.exit(1)
+    bot = JimmyJohnsWSRBot()
+    weeks_to_download = int(os.getenv('WEEKS_TO_DOWNLOAD', 1))
+    bot.run(weeks_to_download)
 
 
 if __name__ == "__main__":
