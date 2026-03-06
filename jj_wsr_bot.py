@@ -134,9 +134,14 @@ class JimmyJohnsWSRBot:
                 for selector in ['button:has-text("SIGN IN")', 'button:has-text("Sign In")',
                                   'button:has-text("Login")', 'button[type="submit"]']:
                     if page.locator(selector).count() > 0:
-                        page.locator(selector).first.click()
+                        page.locator(selector).first.click(timeout=60000, no_wait_after=True)
                         break
 
+                # Portal can be slow to redirect after sign-in
+                try:
+                    page.wait_for_load_state('networkidle', timeout=60000)
+                except Exception:
+                    pass  # Fall through to URL check below
                 page.wait_for_timeout(5000)
 
             if "dashboard" in page.url.lower() or page.locator('text="MY DASHBOARD"').count() > 0:
