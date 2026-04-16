@@ -453,8 +453,19 @@ class JimmyJohnsWSRBot:
             logger.info(f"\n--- Retry Batch {batch_num + 1} of {num_batches}: {sorted(batch_stores)} ---")
 
             # Reload page and re-select week
-            page.reload()
-            page.wait_for_load_state('networkidle', timeout=30000)
+            for _reload_try in range(3):
+                try:
+                    page.reload()
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    break
+                except Exception as _reload_err:
+                    if _reload_try == 2:
+                        raise
+                    logger.warning(
+                        f"  Page reload timed out ({_reload_try + 1}/3), "
+                        f"waiting 5 s before retry..."
+                    )
+                    page.wait_for_timeout(5000)
             page.wait_for_timeout(3000)
             self.select_reporting_week(page, week_offset)
             page.wait_for_timeout(10000)
@@ -546,8 +557,19 @@ class JimmyJohnsWSRBot:
                         # Reload and re-select week before every attempt
                         # (always reload so state is clean, skip only on very first attempt of first batch)
                         if batch_num > 0 or attempt > 1:
-                            page.reload()
-                            page.wait_for_load_state('networkidle', timeout=30000)
+                            for _reload_try in range(3):
+                                try:
+                                    page.reload()
+                                    page.wait_for_load_state('networkidle', timeout=30000)
+                                    break
+                                except Exception as _reload_err:
+                                    if _reload_try == 2:
+                                        raise
+                                    logger.warning(
+                                        f"  Page reload timed out ({_reload_try + 1}/3), "
+                                        f"waiting 5 s before retry..."
+                                    )
+                                    page.wait_for_timeout(5000)
                             page.wait_for_timeout(2000)
                             self.select_reporting_week(page, week_offset)
                             page.wait_for_timeout(10000)
