@@ -46,6 +46,11 @@ EXPECTED_STORES: Set[int] = {
 }
 
 MAX_PARSE_RETRIES = 2   # How many times to retry parsing a failing file
+MAX_REFETCH_ATTEMPTS = 2  # How many times to trigger a targeted re-download
+                          # via the bot when audit shows stores missing from
+                          # the DB (e.g. Macromatix portal returned corrupt
+                          # data that passed the filename-level audit but
+                          # produced zero Expected Deposits records on parse)
 
 
 # ============================================================================
@@ -872,6 +877,113 @@ class WSRParser:
 
         return all_records
 
+    # ========================================================================
+    # REFETCH REPROCESSING
+    # ========================================================================
+
+    def reprocess_missing_stores(
+        self,
+        directory: str,
+        missing_stores: Set[int],
+        new_zip_paths: List[str],
+    ) -> Dict[str, int]:
+        """
+        Called after a parser-triggered refetch has downloaded fresh ZIPs.
+        Extracts ONLY the new ZIPs (so we don't thrash over every file from
+        the initial run), then re-parses and re-upserts both WSR line items
+        and Expected Deposits for the stores that were missing.
+
+        Returns a dict summarizing what was reprocessed:
+          {"wsr_records": int, "expected_records": int, "stores_recovered": int}
+        """
+        result = {"wsr_records": 0, "expected_records": 0, "stores_recovered": 0}
+        if not missing_stores or not new_zip_paths:
+            return result
+
+        logger.info(f"\n{'='*80}")
+        logger.info(
+            f"REPROCESS — {len(missing_stores)} missing stores across "
+            f"{len(new_zip_paths)} new ZIP(s)"
+        )
+        logger.info(f"{'='*80}")
+
+        # Extract the new ZIPs. zipfile.extractall() overwrites existing files
+        # with the same name, so any corrupt copies from earlier runs get
+        # replaced with the fresh downloads.
+        for zip_path in new_zip_paths:
+            if not os.path.exists(zip_path):
+                logger.warning(f"  New ZIP not found on disk: {zip_path}")
+                continue
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(directory)
+                logger.info(f"  ✓ Re-extracted: {os.path.basename(zip_path)}")
+            except Exception as e:
+                logger.error(f"  ✗ Failed to extract {zip_path}: {e}")
+
+        # Find the extracted files for just the missing stores
+        candidate_files: List[str] = []
+        for filename in os.listdir(directory):
+            if filename.startswith('~$'):
+                continue
+            if not (filename.endswith('.xls') or filename.endswith('.xlsx')):
+                continue
+            m = re.match(r'#(\d+)\s', filename)
+            if m and int(m.group(1)) in missing_stores:
+                candidate_files.append(os.path.join(directory, filename))
+
+        if not candidate_files:
+            logger.warning("  No files found for missing stores after refetch")
+            return result
+
+        logger.info(
+            f"  Found {len(candidate_files)} file(s) for missing stores — "
+            f"reparsing WSR + Expected Deposits"
+        )
+
+        # ── Re-parse WSR line items for just the missing stores ────────────
+        wsr_records: List[Dict] = []
+        for filepath in candidate_files:
+            records = self.parse_wsr_file_with_retry(filepath)
+            if records:
+                wsr_records.extend(records)
+
+        if wsr_records:
+            self.upload_to_supabase(wsr_records)
+            result["wsr_records"] = len(wsr_records)
+
+        # ── Re-parse Expected Deposits for just the missing stores ─────────
+        exp_records: List[Dict] = []
+        for filepath in candidate_files:
+            records = self.parse_weekly_sales_file(filepath)
+            if records:
+                exp_records.extend(records)
+
+        if exp_records:
+            self.upload_expected_deposits_to_supabase(exp_records)
+            result["expected_records"] = len(exp_records)
+
+        # Compute how many of the originally-missing stores we actually got
+        recovered = set()
+        for r in wsr_records:
+            try:
+                recovered.add(int(r['store_number']))
+            except (KeyError, TypeError, ValueError):
+                pass
+        for r in exp_records:
+            try:
+                recovered.add(int(r['store_number']))
+            except (KeyError, TypeError, ValueError):
+                pass
+        result["stores_recovered"] = len(recovered & missing_stores)
+
+        logger.info(
+            f"  Reprocess summary: {result['wsr_records']} WSR rows, "
+            f"{result['expected_records']} Expected Deposits rows, "
+            f"{result['stores_recovered']}/{len(missing_stores)} stores recovered"
+        )
+        return result
+
 
 # ============================================================================
 # MAIN EXECUTION
@@ -888,6 +1000,11 @@ def main():
 
     overall_success = True
     unique_weeks = []
+    # Track stores missing from each audit — keyed by week_ending.
+    # Populated during Part 1 (WSR) and Part 2 (Expected Deposits) so the
+    # refetch loop at the bottom of main() can trigger a targeted re-download.
+    wsr_missing_by_week: Dict[str, Set[int]] = {}
+    exp_missing_by_week: Dict[str, Set[int]] = {}
 
     # ========================================================================
     # PART 1: WSR LINE-ITEM DATA
@@ -934,12 +1051,13 @@ def main():
                 logger.info(f"\nTotal WSR records: {len(all_wsr_records)}")
                 logger.info(f"Weeks found: {', '.join(unique_weeks)}")
 
-                # Audit per week
+                # Audit per week — track missing stores for refetch later
                 for week in unique_weeks:
                     week_records = [r for r in all_wsr_records if r['week_ending'] == week]
                     missing = parser.audit_parsed_records(week_records, label=f"WSR week {week}")
                     if missing:
                         overall_success = False
+                        wsr_missing_by_week[week] = set(missing)
 
                 # ── Upload ────────────────────────────────────────────────
                 parser.upload_to_supabase(all_wsr_records)
@@ -966,6 +1084,31 @@ def main():
         if exp_issues["missing_stores"] or exp_issues["incomplete_days"]:
             overall_success = False
 
+        # Per-week tracking for refetch. Expected Deposits records store
+        # week_ending in ISO format ('2026-04-21') while WSR uses mm/dd/yyyy.
+        # Normalize to the WSR format so both audit sets share one key space.
+        def _iso_to_slash(iso: str) -> str:
+            try:
+                if iso and '-' in iso:
+                    y, m, d = iso.split('-')
+                    return f"{int(m):02d}/{int(d):02d}/{y}"
+            except Exception:
+                pass
+            return iso
+
+        from collections import defaultdict
+        exp_stores_by_week: Dict[str, Set[int]] = defaultdict(set)
+        for r in expected_deposits:
+            we_key = _iso_to_slash(r.get('week_ending', ''))
+            try:
+                exp_stores_by_week[we_key].add(int(r['store_number']))
+            except (KeyError, TypeError, ValueError):
+                continue
+        for we_key, seen in exp_stores_by_week.items():
+            missing_exp = EXPECTED_STORES - seen
+            if missing_exp:
+                exp_missing_by_week[we_key] = set(missing_exp)
+
         proceed = auto_confirm
         if not proceed:
             print(f"\nUpload {len(expected_deposits)} expected deposits? (y/n): ", end='')
@@ -990,6 +1133,103 @@ def main():
         verified = parser.verify_supabase_upload(unique_weeks)
         if not verified:
             overall_success = False
+
+    # ========================================================================
+    # REFETCH LOOP — recovers stores missing from either audit
+    # ========================================================================
+    # If either the WSR audit or the Expected Deposits audit flagged stores
+    # as missing (common cause: Macromatix portal returned a half-rendered
+    # file during an overload window), trigger a targeted re-download via
+    # the bot, re-parse + re-upsert just those stores' data, and re-verify.
+    # This runs up to MAX_REFETCH_ATTEMPTS times before giving up.
+    if wsr_missing_by_week or exp_missing_by_week:
+        # Union the two audit sets per week to produce a single refetch set.
+        all_missing_by_week: Dict[str, Set[int]] = {}
+        for week, stores in wsr_missing_by_week.items():
+            all_missing_by_week.setdefault(week, set()).update(stores)
+        for week, stores in exp_missing_by_week.items():
+            all_missing_by_week.setdefault(week, set()).update(stores)
+
+        logger.info(f"\n{'='*80}")
+        logger.info(
+            f"REFETCH TRIGGERED — {sum(len(s) for s in all_missing_by_week.values())} "
+            f"stores missing across {len(all_missing_by_week)} week(s)"
+        )
+        logger.info(f"{'='*80}")
+
+        # Import here so the parser remains importable even if playwright
+        # isn't installed in some environments (e.g. standalone analysis).
+        try:
+            from jj_wsr_bot import JimmyJohnsWSRBot
+            bot = JimmyJohnsWSRBot()
+        except Exception as e:
+            logger.error(f"Could not initialize bot for refetch: {e}")
+            bot = None
+
+        if bot is not None:
+            for week, missing in list(all_missing_by_week.items()):
+                if not missing:
+                    continue
+
+                attempt = 0
+                while missing and attempt < MAX_REFETCH_ATTEMPTS:
+                    attempt += 1
+                    logger.info(
+                        f"\nREFETCH attempt {attempt}/{MAX_REFETCH_ATTEMPTS} "
+                        f"for week {week}: {sorted(missing)}"
+                    )
+
+                    # The bot accepts a week_offset relative to today. The
+                    # parser pipeline normally runs with WEEKS_TO_DOWNLOAD=1,
+                    # so offset 0 (current week) is the right default. If you
+                    # ever run backfills through this path, extend this to
+                    # compute offset from `week` vs today's JJ week.
+                    try:
+                        still_missing, new_zips = bot.refetch_stores(
+                            store_numbers=missing,
+                            week_offset=0,
+                            max_attempts=MAX_RETRY_ATTEMPTS,
+                        )
+                    except Exception as e:
+                        logger.error(f"Refetch attempt {attempt} raised: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        break
+
+                    if new_zips:
+                        parser.reprocess_missing_stores(
+                            directory=download_dir,
+                            missing_stores=missing,
+                            new_zip_paths=new_zips,
+                        )
+
+                    missing = still_missing
+
+                if missing:
+                    logger.error(
+                        f"❌ Week {week}: {len(missing)} stores still missing "
+                        f"after {MAX_REFETCH_ATTEMPTS} refetch attempts: "
+                        f"{sorted(missing)}"
+                    )
+                else:
+                    logger.info(f"✓ Week {week}: all stores recovered via refetch")
+                    # Clear the failure flag for this week since we recovered
+                    wsr_missing_by_week.pop(week, None)
+                    exp_missing_by_week.pop(week, None)
+
+            # Re-verify to confirm the recovered data actually made it
+            if unique_weeks:
+                logger.info(f"\n{'─'*60}")
+                logger.info("Re-verifying Supabase after refetch...")
+                logger.info(f"{'─'*60}")
+                post_verified = parser.verify_supabase_upload(unique_weeks)
+                # If post-refetch verification passes AND no stores still missing
+                # in our tracking dicts, flip overall_success back to True.
+                if post_verified and not wsr_missing_by_week and not exp_missing_by_week:
+                    overall_success = True
+                    logger.info("✓ Refetch recovered all missing data")
+                elif not post_verified:
+                    overall_success = False
 
     # ========================================================================
     # FINAL SUMMARY
