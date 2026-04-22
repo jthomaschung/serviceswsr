@@ -3,15 +3,17 @@ Jimmy John's WSR Export Bot - with Download Audit & Retry
 Automates downloading WSR (Weekly Sales Report) exports from Jimmy John's portal
 """
 
+import io
 import os
 import re
 import time
 import logging
 import zipfile
+import openpyxl
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 import json
 from playwright.sync_api import sync_playwright, Page, Download
 from dotenv import load_dotenv
@@ -62,14 +64,75 @@ class JimmyJohnsWSRBot:
     # AUDIT HELPERS
     # =========================================================================
 
-    def get_downloaded_stores_for_week(self, week_str: str) -> Set[int]:
+    @staticmethod
+    def _validate_wsr_file_content(file_data: bytes, filename: str) -> bool:
         """
-        Scan the processed directory for ZIP files matching week_str and return
-        the set of store numbers found inside them.
+        Validate the Weekly Sales sheet inside an extracted WSR Excel file.
+
+        Catches the Macromatix-overload signature where the WSR line items
+        render correctly but the Expected Deposits section at the bottom of
+        the sheet ships back blank. The specific check is: row 9 must contain
+        at least one valid date in the AM columns (4, 6, 8, 10, 12, 14, 16).
+        A blank date row is the root cause of parse_weekly_sales_file()
+        returning zero records for an otherwise-present store.
+
+        Returns True if the file looks complete enough to parse both WSR
+        line items and Expected Deposits. Returns False on any failure
+        (missing sheet, blank dates, unreadable file).
+        """
+        lower = filename.lower()
+        try:
+            if lower.endswith('.xlsx'):
+                wb = openpyxl.load_workbook(io.BytesIO(file_data), data_only=True)
+                if "Weekly Sales" not in wb.sheetnames:
+                    return False
+                ws = wb["Weekly Sales"]
+                # Row 9, AM columns at 4, 6, 8, 10, 12, 14, 16 (1-indexed)
+                dates_found = sum(
+                    1 for c in range(4, 18, 2)
+                    if ws.cell(9, c).value not in (None, "")
+                )
+                return dates_found >= 7
+            elif lower.endswith('.xls'):
+                df = pd.read_excel(
+                    io.BytesIO(file_data),
+                    sheet_name="Weekly Sales",
+                    header=None,
+                    engine="xlrd",
+                )
+                # Row 9 in sheet = index 8 in 0-indexed df
+                if df.shape[0] <= 8:
+                    return False
+                dates_found = 0
+                for c0_1based in range(4, 18, 2):
+                    c0 = c0_1based - 1
+                    if c0 < df.shape[1] and pd.notna(df.iat[8, c0]):
+                        dates_found += 1
+                return dates_found >= 7
+            else:
+                return False
+        except Exception as e:
+            logger.debug(f"  Content validation error for {filename}: {e}")
+            return False
+
+    def get_downloaded_stores_for_week(
+        self,
+        week_str: str,
+        validate_content: bool = False,
+    ) -> Tuple[Set[int], Set[int]]:
+        """
+        Scan the processed directory for ZIP files matching week_str.
+
+        Returns a tuple of (valid_stores, invalid_stores):
+          • valid_stores    — store numbers whose file passed all checks
+          • invalid_stores  — store numbers whose file was found but had
+                              corrupt/blank content (only populated when
+                              validate_content=True)
 
         week_str format matches the ZIP filename, e.g. '03-03-2026'.
         """
-        found_stores: Set[int] = set()
+        valid_stores: Set[int] = set()
+        invalid_stores: Set[int] = set()
 
         for zip_path in self.processed_dir.glob(f"WSR_Export_{week_str}_*.zip"):
             try:
@@ -77,30 +140,77 @@ class JimmyJohnsWSRBot:
                     for name in zf.namelist():
                         # Files are named like "#3030 03-03-26.xls"
                         m = re.match(r'#(\d+)\s', name)
-                        if m:
-                            found_stores.add(int(m.group(1)))
+                        if not m:
+                            continue
+                        store_num = int(m.group(1))
+
+                        if not validate_content:
+                            valid_stores.add(store_num)
+                            continue
+
+                        # Content validation — read file bytes from the ZIP
+                        # and confirm the Weekly Sales sheet is populated
+                        try:
+                            with zf.open(name) as inner:
+                                data = inner.read()
+                            if self._validate_wsr_file_content(data, name):
+                                valid_stores.add(store_num)
+                            else:
+                                invalid_stores.add(store_num)
+                                logger.warning(
+                                    f"  Content validation FAILED for store "
+                                    f"{store_num} in {zip_path.name} "
+                                    f"(blank dates or missing sheet)"
+                                )
+                        except Exception as e:
+                            invalid_stores.add(store_num)
+                            logger.warning(
+                                f"  Could not validate {name} in {zip_path.name}: {e}"
+                            )
             except Exception as e:
                 logger.warning(f"Could not inspect ZIP {zip_path.name}: {e}")
 
-        return found_stores
+        # A store is only "valid" if it has at least one valid copy. If a
+        # store appears in both sets (bad ZIP + good ZIP from an earlier
+        # retry), treat it as valid and drop it from invalid.
+        invalid_stores -= valid_stores
+        return valid_stores, invalid_stores
 
-    def audit_week_downloads(self, week_str: str) -> Set[int]:
+    def audit_week_downloads(
+        self,
+        week_str: str,
+        validate_content: bool = True,
+    ) -> Set[int]:
         """
         Compare downloaded stores against EXPECTED_STORES.
-        Returns the set of missing store numbers (empty = all good).
+
+        With validate_content=True (default), the audit also opens each
+        store's Excel file and verifies the Weekly Sales sheet has the
+        date row populated. Stores with corrupt files are returned in
+        the "missing" set so the existing retry loop re-downloads them.
+
+        Returns the set of missing OR corrupt store numbers (empty = all good).
         """
-        downloaded = self.get_downloaded_stores_for_week(week_str)
-        missing = EXPECTED_STORES - downloaded
+        valid, invalid = self.get_downloaded_stores_for_week(
+            week_str, validate_content=validate_content
+        )
+        not_downloaded = EXPECTED_STORES - valid - invalid
+        missing = (EXPECTED_STORES - valid)  # union of not_downloaded + invalid
 
         logger.info(f"\n{'─'*60}")
         logger.info(f"DOWNLOAD AUDIT — week {week_str}")
         logger.info(f"  Expected : {len(EXPECTED_STORES)} stores")
-        logger.info(f"  Downloaded: {len(downloaded)} stores")
-
-        if missing:
-            logger.warning(f"  ⚠️  MISSING {len(missing)} stores: {sorted(missing)}")
-        else:
-            logger.info(f"  ✓ All stores accounted for")
+        logger.info(f"  Valid    : {len(valid)} stores")
+        if validate_content and invalid:
+            logger.warning(
+                f"  ⚠️  CORRUPT content ({len(invalid)}): {sorted(invalid)}"
+            )
+        if not_downloaded:
+            logger.warning(
+                f"  ⚠️  NOT downloaded ({len(not_downloaded)}): {sorted(not_downloaded)}"
+            )
+        if not missing:
+            logger.info(f"  ✓ All stores accounted for with valid content")
 
         return missing
 
@@ -491,6 +601,92 @@ class JimmyJohnsWSRBot:
     # =========================================================================
     # MAIN RUN
     # =========================================================================
+
+    def refetch_stores(
+        self,
+        store_numbers: Set[int],
+        week_offset: int = 0,
+        max_attempts: int = MAX_RETRY_ATTEMPTS,
+    ) -> Tuple[Set[int], List[str]]:
+        """
+        Public entry point for targeted re-downloads. Called by the parser
+        when audits show stores missing from the database tables — spins up
+        a fresh Playwright session, logs in, and runs retry_missing_stores
+        until all requested stores have valid files on disk or max_attempts
+        is exhausted.
+
+        Returns (still_missing, downloaded_filepaths):
+          • still_missing — stores we could not recover after all attempts
+          • downloaded_filepaths — ZIPs created during this refetch
+            (the caller can re-extract just these to avoid rescanning the
+            whole processed/ directory)
+        """
+        if not store_numbers:
+            return set(), []
+
+        logger.info(f"\n{'='*60}")
+        logger.info(
+            f"REFETCH — parser requested re-download of "
+            f"{len(store_numbers)} stores: {sorted(store_numbers)}"
+        )
+        logger.info(f"{'='*60}")
+
+        files_before = set(self.processed_dir.glob("WSR_Export_*.zip"))
+        missing = set(store_numbers)
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled'],
+            )
+            context = browser.new_context(
+                accept_downloads=True,
+                viewport={'width': 1920, 'height': 1080},
+            )
+            page = context.new_page()
+            page.on("console", lambda msg: logger.debug(f"Browser: {msg.text}"))
+
+            try:
+                if not self.login(page):
+                    raise Exception("Login failed during refetch")
+
+                if not self.navigate_to_wsr_export(page):
+                    raise Exception("Failed to navigate to WSR Export during refetch")
+
+                selected_week = self.select_reporting_week(page, week_offset)
+                if not selected_week:
+                    raise Exception(f"Failed to select week offset {week_offset} during refetch")
+
+                week_str = selected_week.strip().replace('/', '-')
+
+                # ── Retry loop (same pattern as run()) ─────────────────
+                attempt = 0
+                while missing and attempt < max_attempts:
+                    attempt += 1
+                    logger.info(f"\n--- Refetch attempt {attempt}/{max_attempts} ---")
+                    missing = self.retry_missing_stores(
+                        page, week_offset, selected_week, missing, week_str
+                    )
+            finally:
+                time.sleep(2)
+                browser.close()
+
+        # Figure out which ZIPs are new (downloaded during this refetch)
+        files_after = set(self.processed_dir.glob("WSR_Export_*.zip"))
+        new_files = [str(p) for p in sorted(files_after - files_before)]
+
+        if missing:
+            logger.error(
+                f"❌ Refetch incomplete: {len(missing)} stores still missing "
+                f"after {max_attempts} attempts: {sorted(missing)}"
+            )
+        else:
+            logger.info(
+                f"✓ Refetch complete: recovered all {len(store_numbers)} stores "
+                f"({len(new_files)} new ZIP(s))"
+            )
+
+        return missing, new_files
 
     def run(self, weeks_to_download: int = 1):
         """Main execution — downloads all stores with audit and retry"""
