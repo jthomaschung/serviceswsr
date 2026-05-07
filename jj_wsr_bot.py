@@ -753,19 +753,43 @@ class JimmyJohnsWSRBot:
                         # Reload and re-select week before every attempt
                         # (always reload so state is clean, skip only on very first attempt of first batch)
                         if batch_num > 0 or attempt > 1:
+                            _reload_ok = False
                             for _reload_try in range(3):
                                 try:
-                                    page.reload()
+                                    page.reload(timeout=30000, wait_until='domcontentloaded')
                                     page.wait_for_load_state('networkidle', timeout=30000)
+                                    _reload_ok = True
                                     break
                                 except Exception as _reload_err:
-                                    if _reload_try == 2:
-                                        raise
                                     logger.warning(
-                                        f"  Page reload timed out ({_reload_try + 1}/3), "
-                                        f"waiting 5 s before retry..."
+                                        f"  Page reload attempt ({_reload_try + 1}/3) failed: "
+                                        f"{type(_reload_err).__name__} — waiting 5 s before retry..."
                                     )
                                     page.wait_for_timeout(5000)
+
+                            if not _reload_ok:
+                                # Frame is detached or page context is broken — navigate fresh
+                                logger.warning(
+                                    "  All reload attempts failed (frame may be detached). "
+                                    "Navigating fresh to WSR Export page..."
+                                )
+                                try:
+                                    page.goto(
+                                        self.start_url,
+                                        wait_until='domcontentloaded',
+                                        timeout=45000,
+                                    )
+                                    page.wait_for_load_state('networkidle', timeout=30000)
+                                except Exception as _nav_err:
+                                    logger.error(f"  Fresh navigation to dashboard failed: {_nav_err}")
+                                    raise
+
+                                if not self.navigate_to_wsr_export(page):
+                                    raise RuntimeError(
+                                        "Could not re-navigate to WSR Export after frame detach"
+                                    )
+                                logger.info("  Successfully restored WSR Export page context.")
+
                             page.wait_for_timeout(2000)
                             self.select_reporting_week(page, week_offset)
                             page.wait_for_timeout(10000)
