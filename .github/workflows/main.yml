@@ -42,7 +42,7 @@ jobs:
           JJ_PASSWORD=${{ secrets.JJ_PASSWORD }}
           WEEKS_TO_DOWNLOAD=1
           DOWNLOAD_DIR=./downloads
-          PROCESSED_DIR=./processed
+          PROCESSED_DIR=./downloads
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}
