@@ -844,6 +844,22 @@ class WSRParser:
         logger.info(f"\n{'='*80}")
         logger.info(f"Uploading {len(records)} expected deposits records (upsert)")
 
+        # Deduplicate on the conflict key (store_number, date).
+        # Multiple files for the same store (e.g. both .xls and .xlsx present)
+        # would otherwise produce duplicate keys within a single upsert batch,
+        # causing Postgres error "ON CONFLICT DO UPDATE command cannot affect
+        # row a second time".  Last writer wins — consistent with upsert intent.
+        seen: dict = {}
+        for r in records:
+            seen[(r["store_number"], r["date"])] = r
+        deduped = list(seen.values())
+        if len(deduped) < len(records):
+            logger.warning(
+                f"  Deduplicated {len(records) - len(deduped)} duplicate "
+                f"(store_number, date) rows before upsert"
+            )
+        records = deduped
+
         try:
             for i in range(0, len(records), self.batch_size):
                 batch = records[i:i + self.batch_size]
@@ -1188,7 +1204,7 @@ def main():
                         still_missing, new_zips = bot.refetch_stores(
                             store_numbers=missing,
                             week_offset=0,
-                            max_attempts=MAX_RETRY_ATTEMPTS,
+                            max_attempts=MAX_REFETCH_ATTEMPTS,
                         )
                     except Exception as e:
                         logger.error(f"Refetch attempt {attempt} raised: {e}")
