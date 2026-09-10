@@ -36,8 +36,8 @@ logger = logging.getLogger(__name__)
 
 # Full expected store list — keep in sync with jj_wsr_bot.py
 EXPECTED_STORES: Set[int] = {
-    522, 746, 799, 833, 838, 877, 930, 965, 1002, 1018, 1019, 1061, 1111,
-    1127, 1206, 1261, 1307, 1337, 1342, 1355, 1440, 1441, 1554, 1556, 1562,
+    522, 746, 799, 833, 838, 877, 930, 965, 1002, 1018, 1019, 1061,
+    1111, 1127, 1206, 1261, 1307, 1337, 1342, 1355, 1440, 1554, 1556, 1562,
     1635, 1694, 1695, 1696, 1762, 1779, 1789, 1955, 1956, 1957, 2006, 2021,
     2176, 2178, 2180, 2391, 2500, 2501, 2502, 2503, 2504, 2601, 2682, 2683,
     2711, 2712, 2749, 2807, 2808, 2811, 2812, 2821, 2873, 2874, 2876, 2883,
@@ -417,6 +417,7 @@ class WSRParser:
             2178: {"legal_entity": "Atlas 0519", "class_code": "2178 - EastBell", "store_name": "Bell 2"},
             2501: {"legal_entity": "Atlas 0519", "class_code": "2501 - North Cave", "store_name": "Cave Creek"},
             1127: {"legal_entity": "Atlas East", "class_code": "1127 - St Pete", "store_name": "St Pete"},
+            # 1441 closed 2026-09-10 (Carrollwood) — kept for reprocessing historical weeks
             1441: {"legal_entity": "Atlas East", "class_code": "1441 - Carrollwood", "store_name": "Carrollwood"},
             3030: {"legal_entity": "Atlas East", "class_code": "3030 - Waters", "store_name": "Waters"},
             3187: {"legal_entity": "Atlas East", "class_code": "3187 - Bay Pines", "store_name": "Bay Pines"},
@@ -654,16 +655,117 @@ class WSRParser:
                     by_entity_week[key] = []
                 by_entity_week[key].append(record)
 
+            self.prune_old_week_tabs()
+            self.log_workbook_usage()
+
+            created, failed = 0, []
             for key, entity_records in by_entity_week.items():
                 entity, week = key.split('|')
-                self.create_sheet_tab(f"{entity} {week}", entity_records)
+                tab_name = f"{entity} {week}"
+                if self.create_sheet_tab(tab_name, entity_records):
+                    created += 1
+                else:
+                    failed.append(tab_name)
 
-            logger.info(f"✓ Created {len(by_entity_week)} tabs")
+            if failed:
+                logger.error(
+                    f"✗ {created}/{len(by_entity_week)} tabs written — FAILED: {failed}"
+                )
+            else:
+                logger.info(f"✓ Created/updated {created} tabs")
 
         except Exception as e:
             logger.error(f"Failed to create Google Sheets tabs: {e}")
             import traceback
             traceback.print_exc()
+
+    # ------------------------------------------------------------------
+    # Google Sheets capacity management
+    # ------------------------------------------------------------------
+
+    WEEK_TAB_RE = re.compile(r'^(?P<entity>.+?)\s+(?P<m>\d{2})/(?P<d>\d{2})/(?P<y>\d{4})$')
+
+    def log_workbook_usage(self) -> int:
+        """Report how much of the 10,000,000-cell budget the workbook uses."""
+        try:
+            ss = self.sheets_service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id
+            ).execute()
+            total = 0
+            sizes = []
+            for sheet in ss.get('sheets', []):
+                props = sheet['properties']
+                grid = props.get('gridProperties', {})
+                cells = grid.get('rowCount', 0) * grid.get('columnCount', 0)
+                total += cells
+                sizes.append((cells, props['title']))
+            pct = total / 10_000_000 * 100
+            logger.info(
+                f"Google Sheet: {len(sizes)} tabs, {total:,} cells "
+                f"({pct:.1f}% of the 10,000,000 limit)"
+            )
+            if pct >= 90:
+                sizes.sort(reverse=True)
+                top = ', '.join(f"{t} ({c:,})" for c, t in sizes[:5])
+                logger.warning(f"  Largest tabs: {top}")
+            return total
+        except Exception as e:
+            logger.warning(f"Could not read workbook size: {e}")
+            return 0
+
+    def prune_old_week_tabs(self) -> int:
+        """Delete week tabs older than SHEET_RETENTION_WEEKS.
+
+        Opt-in: unset or 0 means never delete. Only touches tabs whose name
+        matches '<Entity> MM/DD/YYYY', so the Key tab and any hand-made tabs
+        are never at risk.
+        """
+        try:
+            keep = int(os.getenv('SHEET_RETENTION_WEEKS', '0'))
+        except ValueError:
+            keep = 0
+        if keep <= 0:
+            return 0
+
+        try:
+            ss = self.sheets_service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id
+            ).execute()
+
+            by_week = {}
+            for sheet in ss.get('sheets', []):
+                title = sheet['properties']['title']
+                m = self.WEEK_TAB_RE.match(title)
+                if not m:
+                    continue  # Key tab, notes, anything hand-made: leave alone
+                week = f"{m.group('y')}-{m.group('m')}-{m.group('d')}"
+                by_week.setdefault(week, []).append(
+                    (title, sheet['properties']['sheetId'])
+                )
+
+            if len(by_week) <= keep:
+                return 0
+
+            doomed_weeks = sorted(by_week)[:-keep]
+            requests, names = [], []
+            for wk in doomed_weeks:
+                for title, sid in by_week[wk]:
+                    requests.append({'deleteSheet': {'sheetId': sid}})
+                    names.append(title)
+
+            logger.warning(
+                f"Pruning {len(names)} tab(s) from {len(doomed_weeks)} week(s) "
+                f"older than the newest {keep}: {sorted(doomed_weeks)}"
+            )
+            self.sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id, body={'requests': requests}
+            ).execute()
+            logger.info(f"✓ Pruned {len(names)} old week tabs")
+            return len(names)
+
+        except Exception as e:
+            logger.error(f"Tab pruning failed (continuing anyway): {e}")
+            return 0
 
     def create_sheet_tab(self, tab_name: str, records: List[Dict]):
         try:
@@ -676,18 +778,6 @@ class WSRParser:
                 if sheet['properties']['title'] == tab_name:
                     sheet_id = sheet['properties']['sheetId']
                     break
-
-            if sheet_id is None:
-                response = self.sheets_service.spreadsheets().batchUpdate(
-                    spreadsheetId=self.spreadsheet_id,
-                    body={'requests': [{'addSheet': {'properties': {'title': tab_name, 'index': 0}}}]}
-                ).execute()
-                sheet_id = response['replies'][0]['addSheet']['properties']['sheetId']
-            else:
-                self.sheets_service.spreadsheets().batchUpdate(
-                    spreadsheetId=self.spreadsheet_id,
-                    body={'requests': [{'updateCells': {'range': {'sheetId': sheet_id}, 'fields': 'userEnteredValue'}}]}
-                ).execute()
 
             header_row = [['Account', 'Amount', 'Journal Date', 'Description', 'Name', 'Class']]
             data_rows = []
@@ -726,6 +816,49 @@ class WSRParser:
             if skipped_count > 0:
                 logger.info(f"  Skipped {skipped_count} unmapped accounts")
 
+            # Create/resize the tab to EXACTLY the data size. A default addSheet
+            # is 1000x26 = 26,000 cells; at 4 tabs/week that burns ~104k cells a
+            # week and eventually trips the workbook's 10,000,000-cell ceiling.
+            needed_rows = max(len(data_rows) + 1, 2)
+            needed_cols = len(header_row[0])
+
+            if sheet_id is None:
+                response = self.sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={'requests': [{'addSheet': {'properties': {
+                        'title': tab_name,
+                        'index': 0,
+                        'gridProperties': {
+                            'rowCount': needed_rows,
+                            'columnCount': needed_cols,
+                        },
+                    }}}]}
+                ).execute()
+                sheet_id = response['replies'][0]['addSheet']['properties']['sheetId']
+                logger.info(
+                    f"  Created tab '{tab_name}' sized {needed_rows}x{needed_cols} "
+                    f"({needed_rows * needed_cols:,} cells)"
+                )
+            else:
+                # Clear, then shrink an existing oversized tab back down.
+                self.sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={'requests': [
+                        {'updateCells': {'range': {'sheetId': sheet_id},
+                                         'fields': 'userEnteredValue'}},
+                        {'updateSheetProperties': {
+                            'properties': {
+                                'sheetId': sheet_id,
+                                'gridProperties': {
+                                    'rowCount': needed_rows,
+                                    'columnCount': needed_cols,
+                                },
+                            },
+                            'fields': 'gridProperties(rowCount,columnCount)',
+                        }},
+                    ]}
+                ).execute()
+
             self.sheets_service.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
                 range=f"{tab_name}!A1",
@@ -746,11 +879,22 @@ class WSRParser:
             ).execute()
 
             logger.info(f"✓ Wrote {len(data_rows)} rows to tab '{tab_name}'")
+            return True
 
         except Exception as e:
-            logger.error(f"Failed to create/update tab '{tab_name}': {e}")
-            import traceback
-            traceback.print_exc()
+            msg = str(e)
+            if 'above the limit of 10000000 cells' in msg:
+                logger.error(
+                    f"Tab '{tab_name}' NOT created — the Google Sheet is at its "
+                    f"10,000,000-cell ceiling. Old week tabs must be pruned or "
+                    f"archived before new ones can be added. Set "
+                    f"SHEET_RETENTION_WEEKS to enable automatic pruning."
+                )
+            else:
+                logger.error(f"Failed to create/update tab '{tab_name}': {e}")
+                import traceback
+                traceback.print_exc()
+            return False
 
     # ========================================================================
     # PART 2: WEEKLY SALES EXPECTED DEPOSITS
