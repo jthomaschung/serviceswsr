@@ -293,18 +293,59 @@ class JimmyJohnsWSRBot:
             logger.debug("  networkidle not reached (portal keeps connections open) - continuing")
 
     def _wait_for_any(self, page: Page, selectors: List[str], timeout: int = 30000):
-        """Poll for the first selector that becomes visible. Returns it or None."""
+        """Poll for the first selector that appears. Returns it or None.
+
+        Prefers a visible match, but falls back to present-in-DOM before
+        giving up: portal menu items are sometimes in the DOM but not
+        'visible' to Playwright, and clicking them still works because click()
+        scrolls and waits on its own.
+        """
         deadline = time.time() + (timeout / 1000)
+        present_but_hidden = None
         while time.time() < deadline:
             for sel in selectors:
                 try:
                     loc = page.locator(sel).first
-                    if loc.count() > 0 and loc.is_visible():
+                    if loc.count() == 0:
+                        continue
+                    if loc.is_visible():
                         return sel
+                    if present_but_hidden is None:
+                        present_but_hidden = sel
                 except Exception:
                     continue
             page.wait_for_timeout(500)
-        return None
+
+        if present_but_hidden:
+            logger.warning(
+                f"  '{present_but_hidden}' is in the DOM but never became visible "
+                f"— trying it anyway"
+            )
+        return present_but_hidden
+
+    def _dump_nav_candidates(self, page: Page) -> None:
+        """Log the clickable text on the page so a failure explains itself.
+
+        Beats round-tripping a screenshot out of CI: if the portal renamed a
+        menu item or dropped us somewhere unexpected, the new labels show up
+        right here in the log.
+        """
+        try:
+            logger.error(f"  Current URL: {page.url}")
+            labels = page.evaluate("""() => {
+                const out = [];
+                const nodes = document.querySelectorAll(
+                    'a, button, [role="menuitem"], [role="tab"], li'
+                );
+                for (const el of nodes) {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t && t.length <= 60 && !t.includes('\n')) out.push(t);
+                }
+                return [...new Set(out)].slice(0, 60);
+            }""")
+            logger.error(f"  {len(labels)} clickable labels on page: {labels}")
+        except Exception as e:
+            logger.warning(f"  Could not enumerate page labels: {e}")
 
     def login(self, page: Page) -> bool:
         """Handle login if needed"""
@@ -359,7 +400,9 @@ class JimmyJohnsWSRBot:
         'text="WSR EXPORT"',
         'text="WSR Export"',
         'a:has-text("WSR")',
-        '*:has-text("WSR EXPORT")',
+        'button:has-text("WSR")',
+        '[role="menuitem"]:has-text("WSR")',
+        'li:has-text("WSR EXPORT")',
     ]
 
     def navigate_to_wsr_export(self, page: Page) -> bool:
@@ -376,24 +419,45 @@ class JimmyJohnsWSRBot:
                 return True
 
             logger.info("Looking for Sales Reports link...")
-            sales_reports = page.locator('text="Sales Reports"').first
-            if sales_reports.count() == 0:
+            sales_links = page.locator('text="Sales Reports"')
+            n_links = sales_links.count()
+            if n_links == 0:
                 logger.error("Could not find Sales Reports link")
+                self._dump_nav_candidates(page)
                 self._safe_screenshot(page, 'sales_reports_not_found.png')
                 return False
 
-            sales_reports.click()
-            self._wait_settled(page, timeout=10000)
+            if n_links > 1:
+                logger.info(f"  {n_links} elements match 'Sales Reports' — will try each")
 
-            # Wait for the WSR link OR the destination page itself to appear.
-            found = self._wait_for_any(
-                page, self.WSR_LINK_SELECTORS + [self.WSR_READY_SELECTOR], timeout=30000
-            )
+            # Try each "Sales Reports" match in turn. Only one of them is
+            # usually the real nav item; the others are headings or wrappers
+            # that swallow the click and leave the menu unopened.
+            found = None
+            for idx in range(n_links):
+                if idx > 0:
+                    logger.info(f"  Menu did not open — trying match {idx + 1}/{n_links}")
+                try:
+                    sales_links.nth(idx).click(timeout=15000)
+                except Exception as click_err:
+                    logger.warning(f"  Click on match {idx + 1} failed: {click_err}")
+                    continue
+
+                self._wait_settled(page, timeout=10000)
+                found = self._wait_for_any(
+                    page,
+                    self.WSR_LINK_SELECTORS + [self.WSR_READY_SELECTOR],
+                    timeout=20000,
+                )
+                if found:
+                    break
 
             if found is None:
                 logger.error(
-                    "Sales Reports opened but no WSR Export link appeared within 30 s"
+                    "Sales Reports was clicked but no WSR Export link ever appeared. "
+                    "Dumping page state:"
                 )
+                self._dump_nav_candidates(page)
                 self._safe_screenshot(page, 'wsr_link_not_found.png')
                 return False
 
