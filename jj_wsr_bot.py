@@ -218,6 +218,68 @@ class JimmyJohnsWSRBot:
     # LOGIN / NAVIGATION  (unchanged from original)
     # =========================================================================
 
+    # =========================================================================
+    # RESILIENCE HELPERS
+    # =========================================================================
+
+    def _safe_screenshot(self, page: Page, path: str) -> None:
+        """Best-effort screenshot. NEVER raises.
+
+        Page.captureScreenshot fails when the renderer is busy/unresponsive,
+        which is exactly the state the page is in when we hit a timeout. A
+        crashing screenshot inside an `except` block masks the real error and
+        kills the process, so this swallows everything.
+        """
+        try:
+            page.screenshot(
+                path=path,
+                full_page=False,
+                animations='disabled',
+                timeout=15000,
+            )
+            logger.info(f"  Saved diagnostic screenshot: {path}")
+        except Exception as shot_err:
+            logger.warning(f"  Could not capture screenshot {path}: {shot_err}")
+            # Fall back to dumping the DOM, which usually still works.
+            try:
+                html_path = str(Path(path).with_suffix('.html'))
+                with open(html_path, 'w', encoding='utf-8') as fh:
+                    fh.write(page.content())
+                logger.info(f"  Saved page HTML instead: {html_path}")
+            except Exception as html_err:
+                logger.warning(f"  Could not capture page HTML either: {html_err}")
+
+    def _wait_settled(self, page: Page, timeout: int = 10000) -> None:
+        """Wait for the page to settle. NEVER raises.
+
+        The Macromatix portal holds long-lived/polling connections open, so
+        'networkidle' (500 ms of zero network traffic) frequently never fires
+        even though the page is fully usable. Treat it as a nicety, not a
+        requirement -- callers should assert on real elements instead.
+        """
+        try:
+            page.wait_for_load_state('domcontentloaded', timeout=timeout)
+        except Exception:
+            pass
+        try:
+            page.wait_for_load_state('networkidle', timeout=timeout)
+        except Exception:
+            logger.debug("  networkidle not reached (portal keeps connections open) - continuing")
+
+    def _wait_for_any(self, page: Page, selectors: List[str], timeout: int = 30000):
+        """Poll for the first selector that becomes visible. Returns it or None."""
+        deadline = time.time() + (timeout / 1000)
+        while time.time() < deadline:
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.count() > 0 and loc.is_visible():
+                        return sel
+                except Exception:
+                    continue
+            page.wait_for_timeout(500)
+        return None
+
     def login(self, page: Page) -> bool:
         """Handle login if needed"""
         try:
@@ -248,10 +310,7 @@ class JimmyJohnsWSRBot:
                         break
 
                 # Portal can be slow to redirect after sign-in
-                try:
-                    page.wait_for_load_state('networkidle', timeout=60000)
-                except Exception:
-                    pass  # Fall through to URL check below
+                self._wait_settled(page, timeout=20000)
                 page.wait_for_timeout(5000)
 
             if "dashboard" in page.url.lower() or page.locator('text="MY DASHBOARD"').count() > 0:
@@ -259,50 +318,80 @@ class JimmyJohnsWSRBot:
                 return True
             else:
                 logger.error(f"Login failed. Current URL: {page.url}")
-                page.screenshot(path='login_failed.png')
+                self._safe_screenshot(page, 'login_failed.png')
                 return False
 
         except Exception as e:
             logger.error(f"Login process failed: {e}")
-            page.screenshot(path='login_error.png')
+            self._safe_screenshot(page, 'login_error.png')
             return False
 
+    # Selector that proves we actually landed on the WSR Export page
+    WSR_READY_SELECTOR = 'text="Select Reporting Week Ending Date"'
+
+    WSR_LINK_SELECTORS = [
+        'text="WSR EXPORT"',
+        'text="WSR Export"',
+        'a:has-text("WSR")',
+        '*:has-text("WSR EXPORT")',
+    ]
+
     def navigate_to_wsr_export(self, page: Page) -> bool:
-        """Navigate to WSR Export page"""
+        """Navigate to WSR Export page.
+
+        Waits on real page elements rather than 'networkidle' -- the portal
+        keeps polling connections open, so networkidle never fires and the old
+        code timed out on a page that had in fact loaded correctly.
+        """
         try:
+            # Already there? (e.g. re-entry after a frame detach)
+            if page.locator(self.WSR_READY_SELECTOR).count() > 0:
+                logger.info("Already on WSR Export page")
+                return True
+
             logger.info("Looking for Sales Reports link...")
-            sales_reports = page.locator('text="Sales Reports"')
-            if sales_reports.count() > 0:
-                sales_reports.click()
-                page.wait_for_load_state('networkidle', timeout=15000)
-                page.wait_for_timeout(2000)
-
-                for selector in ['text="WSR EXPORT"', 'text="WSR Export"',
-                                  'a:has-text("WSR")', '*:has-text("WSR EXPORT")']:
-                    if page.locator(selector).count() > 0:
-                        page.locator(selector).first.click()
-                        page.wait_for_load_state('networkidle', timeout=10000)
-                        page.wait_for_timeout(2000)
-
-                        if page.locator('text="Select Reporting Week Ending Date"').count() > 0:
-                            logger.info("Successfully on WSR Export page")
-                            return True
-                        break
-
-                if page.locator('text="Select Reporting Week Ending Date"').count() == 0:
-                    logger.error("Could not find WSR Export page elements")
-                    page.screenshot(path='wsr_navigation_failed.png')
-                    return False
-            else:
+            sales_reports = page.locator('text="Sales Reports"').first
+            if sales_reports.count() == 0:
                 logger.error("Could not find Sales Reports link")
-                page.screenshot(path='sales_reports_not_found.png')
+                self._safe_screenshot(page, 'sales_reports_not_found.png')
                 return False
 
+            sales_reports.click()
+            self._wait_settled(page, timeout=10000)
+
+            # Wait for the WSR link OR the destination page itself to appear.
+            found = self._wait_for_any(
+                page, self.WSR_LINK_SELECTORS + [self.WSR_READY_SELECTOR], timeout=30000
+            )
+
+            if found is None:
+                logger.error(
+                    "Sales Reports opened but no WSR Export link appeared within 30 s"
+                )
+                self._safe_screenshot(page, 'wsr_link_not_found.png')
+                return False
+
+            if found != self.WSR_READY_SELECTOR:
+                logger.info(f"Clicking WSR Export link ({found})...")
+                page.locator(found).first.click()
+                self._wait_settled(page, timeout=10000)
+
+            # Assert on the destination element, with a generous grace period.
+            try:
+                page.wait_for_selector(
+                    self.WSR_READY_SELECTOR, state='visible', timeout=30000
+                )
+            except Exception:
+                logger.error("Could not find WSR Export page elements")
+                self._safe_screenshot(page, 'wsr_navigation_failed.png')
+                return False
+
+            logger.info("Successfully on WSR Export page")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to navigate to WSR Export: {e}")
-            page.screenshot(path='navigation_error.png')
+            logger.error(f"Failed to navigate to WSR Export: {type(e).__name__}: {e}")
+            self._safe_screenshot(page, 'navigation_error.png')
             return False
 
     def select_reporting_week(self, page: Page, week_offset: int = 0) -> str:
@@ -356,7 +445,7 @@ class JimmyJohnsWSRBot:
                 page.wait_for_timeout(500)
                 if page.locator('input[type="checkbox"]').count() <= 1:
                     logger.error("Could not open Stores dropdown")
-                    page.screenshot(path='stores_dropdown_failed.png')
+                    self._safe_screenshot(page, 'stores_dropdown_failed.png')
                     return False
 
             try:
@@ -566,7 +655,7 @@ class JimmyJohnsWSRBot:
             for _reload_try in range(3):
                 try:
                     page.reload()
-                    page.wait_for_load_state('networkidle', timeout=30000)
+                    self._wait_settled(page, timeout=20000)
                     break
                 except Exception as _reload_err:
                     if _reload_try == 2:
@@ -757,7 +846,7 @@ class JimmyJohnsWSRBot:
                             for _reload_try in range(3):
                                 try:
                                     page.reload(timeout=30000, wait_until='domcontentloaded')
-                                    page.wait_for_load_state('networkidle', timeout=30000)
+                                    self._wait_settled(page, timeout=20000)
                                     _reload_ok = True
                                     break
                                 except Exception as _reload_err:
@@ -779,7 +868,7 @@ class JimmyJohnsWSRBot:
                                         wait_until='domcontentloaded',
                                         timeout=45000,
                                     )
-                                    page.wait_for_load_state('networkidle', timeout=30000)
+                                    self._wait_settled(page, timeout=20000)
                                 except Exception as _nav_err:
                                     logger.error(f"  Fresh navigation to dashboard failed: {_nav_err}")
                                     raise
