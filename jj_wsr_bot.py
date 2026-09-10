@@ -33,14 +33,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Full expected store list — update if fleet changes
+# 1441 removed 2026-09-10: store closed, no longer offered by the portal.
 EXPECTED_STORES = {
     522, 746, 799, 833, 838, 877, 930, 965, 1002, 1018, 1019, 1061, 1111,
-    1127, 1206, 1261, 1307, 1337, 1342, 1355, 1440, 1441, 1554, 1556, 1562,
-    1635, 1694, 1695, 1696, 1762, 1779, 1789, 1955, 1956, 1957, 2006, 2021,
-    2176, 2178, 2180, 2391, 2500, 2501, 2502, 2503, 2504, 2601, 2682, 2683,
-    2711, 2712, 2749, 2807, 2808, 2811, 2812, 2821, 2873, 2874, 2876, 2883,
-    2884, 3029, 3030, 3187, 3260, 3391, 3612, 3613, 3635, 3686, 3972, 4018,
-    4022, 4024, 4105, 4330, 4358, 4586,
+    1127, 1206, 1261, 1307, 1337, 1342, 1355, 1440, 1554, 1556, 1562, 1635, 1694,
+    1695, 1696, 1762, 1779, 1789, 1955, 1956, 1957, 2006, 2021, 2176, 2178, 2180,
+    2391, 2500, 2501, 2502, 2503, 2504, 2601, 2682, 2683, 2711, 2712, 2749, 2807,
+    2808, 2811, 2812, 2821, 2873, 2874, 2876, 2883, 2884, 3029, 3030, 3187, 3260,
+    3391, 3612, 3613, 3635, 3686, 3972, 4018, 4022, 4024, 4105, 4330, 4358, 4586,
 }
 
 MAX_RETRY_ATTEMPTS = 2  # How many times to retry missing stores after initial run
@@ -180,6 +180,7 @@ class JimmyJohnsWSRBot:
         self,
         week_str: str,
         validate_content: bool = True,
+        portal_roster: Optional[Set[int]] = None,
     ) -> Set[int]:
         """
         Compare downloaded stores against EXPECTED_STORES.
@@ -194,13 +195,38 @@ class JimmyJohnsWSRBot:
         valid, invalid = self.get_downloaded_stores_for_week(
             week_str, validate_content=validate_content
         )
-        not_downloaded = EXPECTED_STORES - valid - invalid
-        missing = (EXPECTED_STORES - valid)  # union of not_downloaded + invalid
+        missing = EXPECTED_STORES - valid
+
+        # Split "portal has no such store" from "download genuinely failed".
+        # Only the latter is retryable, and only the latter should fail the run.
+        if portal_roster:
+            absent_from_portal = missing - portal_roster
+            missing = missing & portal_roster
+        else:
+            absent_from_portal = set()
+
+        not_downloaded = missing - invalid
 
         logger.info(f"\n{'─'*60}")
         logger.info(f"DOWNLOAD AUDIT — week {week_str}")
-        logger.info(f"  Expected : {len(EXPECTED_STORES)} stores")
+        logger.info(f"  Expected : {len(EXPECTED_STORES)} stores (roster in code)")
+        if portal_roster:
+            logger.info(f"  In portal: {len(portal_roster)} stores")
         logger.info(f"  Valid    : {len(valid)} stores")
+        if absent_from_portal:
+            logger.warning(
+                f"  ℹ️  NOT OFFERED BY PORTAL ({len(absent_from_portal)}): "
+                f"{sorted(absent_from_portal)} — these are in EXPECTED_STORES but "
+                f"the portal does not list them for this week. Not retryable; "
+                f"update EXPECTED_STORES if the store is closed or transferred."
+            )
+        if portal_roster:
+            unexpected = portal_roster - EXPECTED_STORES
+            if unexpected:
+                logger.warning(
+                    f"  ℹ️  IN PORTAL BUT NOT EXPECTED ({len(unexpected)}): "
+                    f"{sorted(unexpected)} — new stores? Add to EXPECTED_STORES."
+                )
         if validate_content and invalid:
             logger.warning(
                 f"  ⚠️  CORRUPT content ({len(invalid)}): {sorted(invalid)}"
@@ -210,7 +236,7 @@ class JimmyJohnsWSRBot:
                 f"  ⚠️  NOT downloaded ({len(not_downloaded)}): {sorted(not_downloaded)}"
             )
         if not missing:
-            logger.info(f"  ✓ All stores accounted for with valid content")
+            logger.info(f"  ✓ All portal-available stores downloaded with valid content")
 
         return missing
 
@@ -464,6 +490,49 @@ class JimmyJohnsWSRBot:
             logger.error(f"open_stores_dropdown failed: {e}")
             return False
 
+    def _read_store_numbers(self, page: Page) -> Dict[int, int]:
+        """Map {store_number: checkbox_index} by reading each checkbox's label.
+
+        Assumes the stores dropdown is already open.
+        """
+        roster = {}
+        checkboxes = page.locator('input[type="checkbox"]').all()
+        for i, cb in enumerate(checkboxes[1:], start=1):  # skip "Select All"
+            try:
+                label_text = page.evaluate(
+                    """(el) => {
+                        const parent = el.closest('li') || el.parentElement;
+                        return parent ? parent.textContent.trim() : '';
+                    }""",
+                    cb.element_handle()
+                )
+                m = re.search(r'#?(\d{3,5})', label_text)
+                if m:
+                    roster[int(m.group(1))] = i
+            except Exception:
+                continue
+        return roster
+
+    def get_store_roster(self, page: Page) -> Set[int]:
+        """Return the set of store numbers the portal actually offers.
+
+        Lets us tell 'the portal has no such store' apart from 'the download
+        failed' -- the audit previously conflated the two and spent its whole
+        retry budget re-requesting a store that does not exist.
+        """
+        try:
+            if not self.open_stores_dropdown(page):
+                logger.warning("Could not open stores dropdown to read roster")
+                return set()
+            roster = set(self._read_store_numbers(page).keys())
+            page.keyboard.press('Escape')
+            page.wait_for_timeout(500)
+            logger.info(f"Portal roster: {len(roster)} stores")
+            return roster
+        except Exception as e:
+            logger.error(f"Failed to read store roster: {e}")
+            return set()
+
     def get_all_stores(self, page: Page) -> int:
         """Get count of all available stores"""
         try:
@@ -634,7 +703,8 @@ class JimmyJohnsWSRBot:
 
     def retry_missing_stores(self, page: Page, week_offset: int,
                               selected_week: str, missing_stores: Set[int],
-                              week_str: str) -> Set[int]:
+                              week_str: str,
+                              portal_roster: Optional[Set[int]] = None) -> Set[int]:
         """
         Attempt to download only the missing stores.
         Downloads them in batches of 15 and returns any still-missing stores after.
@@ -684,7 +754,9 @@ class JimmyJohnsWSRBot:
                 logger.warning(f"Could not select stores for retry batch {batch_num + 1}")
 
         # Re-audit after retry
-        still_missing = self.audit_week_downloads(week_str)
+        still_missing = self.audit_week_downloads(
+            week_str, portal_roster=portal_roster
+        )
         return still_missing
 
     # =========================================================================
@@ -754,7 +826,8 @@ class JimmyJohnsWSRBot:
                     attempt += 1
                     logger.info(f"\n--- Refetch attempt {attempt}/{max_attempts} ---")
                     missing = self.retry_missing_stores(
-                        page, week_offset, selected_week, missing, week_str
+                        page, week_offset, selected_week, missing, week_str,
+                        portal_roster=portal_roster
                     )
             finally:
                 time.sleep(2)
@@ -821,6 +894,17 @@ class JimmyJohnsWSRBot:
                 if total_stores == 0:
                     logger.error("No stores found")
                     continue
+
+                # Read which stores the portal actually offers this week, so the
+                # audit can distinguish "not available" from "download failed".
+                portal_roster = self.get_store_roster(page)
+                if portal_roster:
+                    stale = EXPECTED_STORES - portal_roster
+                    if stale:
+                        logger.warning(
+                            f"EXPECTED_STORES lists {len(stale)} store(s) the portal "
+                            f"does not offer for week {week_str}: {sorted(stale)}"
+                        )
 
                 batch_size = 5
                 num_batches = (total_stores + batch_size - 1) // batch_size
@@ -908,7 +992,9 @@ class JimmyJohnsWSRBot:
                         time.sleep(10)
 
                 # ── Audit ─────────────────────────────────────────────────
-                missing = self.audit_week_downloads(week_str)
+                missing = self.audit_week_downloads(
+                    week_str, portal_roster=portal_roster
+                )
 
                 # ── Retry loop ────────────────────────────────────────────
                 attempt = 0
