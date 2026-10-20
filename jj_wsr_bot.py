@@ -292,6 +292,18 @@ class JimmyJohnsWSRBot:
         except Exception:
             logger.debug("  networkidle not reached (portal keeps connections open) - continuing")
 
+    @staticmethod
+    def _session_expired(page: Page) -> bool:
+        """True when the portal has bounced us to the prod-auth sign-in page.
+
+        The session can expire partway through a ~15-minute run; a plain
+        reload then lands on prod-auth and every WSR selector times out.
+        """
+        try:
+            return "prod-auth." in page.url.lower()
+        except Exception:
+            return False
+
     def _wait_for_any(self, page: Page, selectors: List[str], timeout: int = 30000):
         """Poll for the first selector that appears. Returns it or None.
 
@@ -799,6 +811,10 @@ class JimmyJohnsWSRBot:
                         f"waiting 5 s before retry..."
                     )
                     page.wait_for_timeout(5000)
+            if self._session_expired(page):
+                logger.warning("  Session expired (redirected to sign-in) — logging in again...")
+                if not self.login(page) or not self.navigate_to_wsr_export(page):
+                    raise RuntimeError("Could not restore WSR Export page after session expiry")
             page.wait_for_timeout(3000)
             self.select_reporting_week(page, week_offset)
             page.wait_for_timeout(10000)
@@ -883,6 +899,17 @@ class JimmyJohnsWSRBot:
                     raise Exception(f"Failed to select week offset {week_offset} during refetch")
 
                 week_str = selected_week.strip().replace('/', '-')
+
+                # Same roster check as run(), so a store the portal no longer
+                # offers is reported as absent instead of retried forever.
+                portal_roster = self.get_store_roster(page)
+                if portal_roster:
+                    absent = missing - portal_roster
+                    if absent:
+                        logger.warning(
+                            f"Portal does not offer {len(absent)} requested store(s) "
+                            f"for week {week_str}: {sorted(absent)}"
+                        )
 
                 # ── Retry loop (same pattern as run()) ─────────────────
                 attempt = 0
@@ -995,6 +1022,9 @@ class JimmyJohnsWSRBot:
                                 try:
                                     page.reload(timeout=30000, wait_until='domcontentloaded')
                                     self._wait_settled(page, timeout=20000)
+                                    if self._session_expired(page):
+                                        logger.warning("  Session expired (redirected to sign-in).")
+                                        break
                                     _reload_ok = True
                                     break
                                 except Exception as _reload_err:
@@ -1005,21 +1035,15 @@ class JimmyJohnsWSRBot:
                                     page.wait_for_timeout(5000)
 
                             if not _reload_ok:
-                                # Frame is detached or page context is broken — navigate fresh
+                                # Frame is detached, page context is broken, or the
+                                # portal session expired — log in again (a no-op if
+                                # still signed in) and navigate fresh.
                                 logger.warning(
-                                    "  All reload attempts failed (frame may be detached). "
-                                    "Navigating fresh to WSR Export page..."
+                                    "  Reload did not restore the page (frame detached or "
+                                    "session expired). Re-logging in and navigating fresh..."
                                 )
-                                try:
-                                    page.goto(
-                                        self.start_url,
-                                        wait_until='domcontentloaded',
-                                        timeout=45000,
-                                    )
-                                    self._wait_settled(page, timeout=20000)
-                                except Exception as _nav_err:
-                                    logger.error(f"  Fresh navigation to dashboard failed: {_nav_err}")
-                                    raise
+                                if not self.login(page):
+                                    raise RuntimeError("Re-login failed while recovering page context")
 
                                 if not self.navigate_to_wsr_export(page):
                                     raise RuntimeError(
@@ -1069,7 +1093,8 @@ class JimmyJohnsWSRBot:
                     logger.info(f"{'='*50}")
 
                     missing = self.retry_missing_stores(
-                        page, week_offset, selected_week, missing, week_str
+                        page, week_offset, selected_week, missing, week_str,
+                        portal_roster=portal_roster
                     )
 
                 if missing:

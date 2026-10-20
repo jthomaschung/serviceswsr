@@ -1327,9 +1327,16 @@ def main():
             bot = None
 
         if bot is not None:
+            # The bot downloads the N most recent weeks as offsets 0..N-1, so
+            # a week's position (newest first) is its offset in the portal.
+            weeks_newest_first = sorted(
+                set(unique_weeks) | set(all_missing_by_week),
+                key=_to_iso_date, reverse=True,
+            )
             for week, missing in list(all_missing_by_week.items()):
                 if not missing:
                     continue
+                week_offset = weeks_newest_first.index(week)
 
                 attempt = 0
                 while missing and attempt < MAX_REFETCH_ATTEMPTS:
@@ -1339,15 +1346,10 @@ def main():
                         f"for week {week}: {sorted(missing)}"
                     )
 
-                    # The bot accepts a week_offset relative to today. The
-                    # parser pipeline normally runs with WEEKS_TO_DOWNLOAD=1,
-                    # so offset 0 (current week) is the right default. If you
-                    # ever run backfills through this path, extend this to
-                    # compute offset from `week` vs today's JJ week.
                     try:
                         still_missing, new_zips = bot.refetch_stores(
                             store_numbers=missing,
-                            week_offset=0,
+                            week_offset=week_offset,
                             max_attempts=MAX_REFETCH_ATTEMPTS,
                         )
                     except Exception as e:

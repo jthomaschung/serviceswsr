@@ -6,8 +6,13 @@ on:
     # Adjust timezone by changing the hour (17 = noon EST, 18 = noon CST, 19 = noon MST, 20 = noon PST)
     - cron: '0 17 * * 3'
   
-  # Allow manual triggering for testing
+  # Allow manual triggering for testing or backfilling missed weeks
   workflow_dispatch:
+    inputs:
+      weeks:
+        description: 'How many recent weeks to pull (2 = this week + last week)'
+        required: false
+        default: '1'
 
 jobs:
   process-wsr:
@@ -40,7 +45,7 @@ jobs:
           cat > .env << EOF
           JJ_EMAIL=${{ secrets.JJ_EMAIL }}
           JJ_PASSWORD=${{ secrets.JJ_PASSWORD }}
-          WEEKS_TO_DOWNLOAD=1
+          WEEKS_TO_DOWNLOAD=${{ inputs.weeks || '1' }}
           DOWNLOAD_DIR=./downloads
           PROCESSED_DIR=./downloads
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
