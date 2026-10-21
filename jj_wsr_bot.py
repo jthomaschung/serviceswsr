@@ -34,13 +34,14 @@ logger = logging.getLogger(__name__)
 
 # Full expected store list — update if fleet changes
 # 1441 removed 2026-09-10: store closed, no longer offered by the portal.
+# 4018 removed 2026-10-20: store closed/sold, not offered since week ending 10/13.
 EXPECTED_STORES = {
     522, 746, 799, 833, 838, 877, 930, 965, 1002, 1018, 1019, 1061, 1111,
     1127, 1206, 1261, 1307, 1337, 1342, 1355, 1440, 1554, 1556, 1562, 1635, 1694,
     1695, 1696, 1762, 1779, 1789, 1955, 1956, 1957, 2006, 2021, 2176, 2178, 2180,
     2391, 2500, 2501, 2502, 2503, 2504, 2601, 2682, 2683, 2711, 2712, 2749, 2807,
     2808, 2811, 2812, 2821, 2873, 2874, 2876, 2883, 2884, 3029, 3030, 3187, 3260,
-    3391, 3612, 3613, 3635, 3686, 3972, 4018, 4022, 4024, 4105, 4330, 4358, 4586,
+    3391, 3612, 3613, 3635, 3686, 3972, 4022, 4024, 4105, 4330, 4358, 4586,
 }
 
 MAX_RETRY_ATTEMPTS = 2  # How many times to retry missing stores after initial run
