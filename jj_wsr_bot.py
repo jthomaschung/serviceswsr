@@ -305,6 +305,28 @@ class JimmyJohnsWSRBot:
         except Exception:
             return False
 
+    def _wsr_page_ready(self, page: Page, timeout: int = 20000) -> bool:
+        """True once the WSR Export page's week picker is visible."""
+        try:
+            page.locator(self.WSR_READY_SELECTOR).first.wait_for(state='visible', timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    def _relogin_to_wsr(self, page: Page) -> bool:
+        """Sign in from scratch and return to the WSR Export page.
+
+        The dashboard (prod-services) and the WSR app (prod-app) hold separate
+        sessions. When only the WSR app's session expires, login() sees a live
+        dashboard and skips the credentials, and the WSR app then sits on
+        prod-auth forever. Clearing cookies forces a real sign-in for both.
+        """
+        try:
+            page.context.clear_cookies()
+        except Exception as e:
+            logger.warning(f"  Could not clear cookies before re-login: {e}")
+        return self.login(page) and self.navigate_to_wsr_export(page)
+
     def _wait_for_any(self, page: Page, selectors: List[str], timeout: int = 30000):
         """Poll for the first selector that appears. Returns it or None.
 
@@ -812,9 +834,9 @@ class JimmyJohnsWSRBot:
                         f"waiting 5 s before retry..."
                     )
                     page.wait_for_timeout(5000)
-            if self._session_expired(page):
-                logger.warning("  Session expired (redirected to sign-in) — logging in again...")
-                if not self.login(page) or not self.navigate_to_wsr_export(page):
+            if self._session_expired(page) or not self._wsr_page_ready(page):
+                logger.warning("  WSR Export page lost after reload (session expired) — signing in again...")
+                if not self._relogin_to_wsr(page):
                     raise RuntimeError("Could not restore WSR Export page after session expiry")
             page.wait_for_timeout(3000)
             self.select_reporting_week(page, week_offset)
@@ -1023,8 +1045,11 @@ class JimmyJohnsWSRBot:
                                 try:
                                     page.reload(timeout=30000, wait_until='domcontentloaded')
                                     self._wait_settled(page, timeout=20000)
-                                    if self._session_expired(page):
-                                        logger.warning("  Session expired (redirected to sign-in).")
+                                    # The WSR app can bounce to prod-auth a few seconds
+                                    # after the reload itself succeeds, so wait for the
+                                    # page's own content rather than trusting the reload.
+                                    if self._session_expired(page) or not self._wsr_page_ready(page):
+                                        logger.warning("  WSR Export page did not come back (session expired).")
                                         break
                                     _reload_ok = True
                                     break
@@ -1037,18 +1062,15 @@ class JimmyJohnsWSRBot:
 
                             if not _reload_ok:
                                 # Frame is detached, page context is broken, or the
-                                # portal session expired — log in again (a no-op if
-                                # still signed in) and navigate fresh.
+                                # portal session expired — sign in from scratch and
+                                # navigate fresh.
                                 logger.warning(
                                     "  Reload did not restore the page (frame detached or "
-                                    "session expired). Re-logging in and navigating fresh..."
+                                    "session expired). Signing in again and navigating fresh..."
                                 )
-                                if not self.login(page):
-                                    raise RuntimeError("Re-login failed while recovering page context")
-
-                                if not self.navigate_to_wsr_export(page):
+                                if not self._relogin_to_wsr(page):
                                     raise RuntimeError(
-                                        "Could not re-navigate to WSR Export after frame detach"
+                                        "Could not re-navigate to WSR Export after session expiry"
                                     )
                                 logger.info("  Successfully restored WSR Export page context.")
 
