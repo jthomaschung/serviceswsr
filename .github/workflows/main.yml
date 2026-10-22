@@ -79,6 +79,7 @@ jobs:
           name: wsr-logs
           path: |
             *.log
+            *.png
           retention-days: 7
       
       - name: Notify on failure
